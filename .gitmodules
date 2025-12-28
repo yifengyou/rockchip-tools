@@ -1,0 +1,3 @@
+[submodule "rockchip-linux-rkbin.git"]
+	path = rockchip-linux-rkbin.git
+	url = https://ghfast.top/https://github.com/rockchip-linux/rkbin
