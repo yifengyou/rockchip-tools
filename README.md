@@ -12,7 +12,6 @@ Bug report, questions and discussion are welcome, you can post an issue or pull 
 1. **极度严格遵守法律法规**
 2. **仅玩耍，有问题提issue**
 
----
 
 
 
@@ -37,6 +36,3 @@ Bug report, questions and discussion are welcome, you can post an issue or pull 
 
 
 
-
-
----
