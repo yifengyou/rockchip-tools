@@ -7,6 +7,7 @@ ATAG: 0x00200800
 MACHINE: 3399
 CHECK_MASK: 0x80
 PWR_HLD: 0,0,A,0,1
+TYPE: GPT
 CMDLINE: androidboot.baseband=N/A androidboot.selinux=permissive androidboot.veritymode=/dev/block/platform/ff0f0000.dwmmc/by-name/metadata androidboot.hardware=rk30board androidboot.console=ttyFIQ0 root=/dev/mmcblk1p4 rw mtdparts=rk29xxnand:0x00002000@0x00004000(uboot),0x00002000@0x00006000(trust),0x00100000@0x00008000(boot),-@0x00108000(rootfs:grow)
 uuid:boot=7a3f0000-0000-446a-8000-702f00006273
 uuid:rootfs=614e0000-0000-4b53-8000-1d28000054a9
