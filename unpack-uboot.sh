@@ -16,7 +16,7 @@ fi
 
 mkdir -p "$OUTPUT_DIR" 
 
-dumpimage -l uboot.img > "$OUTPUT_DIR/image_info.txt"
+dumpimage -l ${UBOOT_IMG} > "$OUTPUT_DIR/image_info.txt"
 
 #dumpimage -i uboot.img -T flat_dt -p 0 uboot.img-unpack/uboot
 #dumpimage -i uboot.img -T flat_dt -p 1 uboot.img-unpack/atf-1
@@ -27,7 +27,7 @@ dumpimage -l uboot.img > "$OUTPUT_DIR/image_info.txt"
 #dumpimage -i uboot.img -T flat_dt -p 6 uboot.img-unpack/fdt
 
 # 解析dumpimage输出并导出各Image节
-dumpimage -l uboot.img | grep 'Image' | while read line; do
+dumpimage -l ${UBOOT_IMG} | grep 'Image' | while read line; do
     if [[ $line =~ ^Image[[:space:]]+([0-9]+)[[:space:]]+\((.+)\) ]]; then
         IMAGE_NUM="${BASH_REMATCH[1]}"
         IMAGE_NAME="${BASH_REMATCH[2]}"
