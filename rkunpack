@@ -1,0 +1,448 @@
+#!/bin/bash
+
+WORKDIR=$(pwd)
+
+usage() {
+    cat <<EOF
+Usage: rkunpack [OPTIONS] <image_file> [image_file2 ...]
+
+Rockchip image unpack tool - auto-detect image type and unpack.
+Supports multiple files and glob patterns (e.g. rkunpack *.img).
+
+Options:
+    -o, --output DIR   Specify output directory (default: <filename>-unpack)
+    -h, --help         Show this help message
+
+Supported image types:
+    - update.img       (rkImageMaker format)
+    - boot.img         (Android bootimg / Device Tree Blob)
+    - uboot.img        (U-Boot FIT image)
+    - resource.img     (Rockchip resource image)
+EOF
+    exit 0
+}
+
+OUTPUT_DIR=""
+FAIL_COUNT=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o|--output)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        -*)
+            echo "Error: Unknown option $1"
+            usage
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+if [ $# -eq 0 ]; then
+    echo "Error: No image file specified"
+    usage
+fi
+
+default_outdir() {
+    local img="$1"
+    echo "${img}-unpack"
+}
+
+detect_image_type() {
+    local img="$1"
+    local basename
+    basename=$(basename "$img")
+
+    if [[ "$basename" =~ ^update\.img$ ]] || rkImageMaker -info "$img" >/dev/null 2>&1; then
+        echo "update"
+        return
+    fi
+
+    local file_info
+    file_info=$(file -b "$img")
+
+    if [[ "$basename" =~ ^uboot\.img ]] || [[ "$file_info" =~ "U-Boot" ]]; then
+        echo "uboot"
+        return
+    fi
+
+    if [[ "$basename" =~ ^resource\.img ]] || [[ "$file_info" =~ "Rockchip.*resource" ]]; then
+        echo "resource"
+        return
+    fi
+
+    if [[ "$basename" =~ ^boot\.img ]]; then
+        if [[ "$file_info" =~ "Android bootimg" ]]; then
+            echo "boot-android"
+            return
+        elif [[ "$file_info" =~ "Device Tree Blob" ]]; then
+            echo "boot-dtb"
+            return
+        fi
+        echo "boot-unknown"
+        return
+    fi
+
+    if [[ "$file_info" =~ "Android bootimg" ]]; then
+        echo "boot-android"
+        return
+    fi
+
+    if [[ "$file_info" =~ "Device Tree Blob" ]]; then
+        echo "boot-dtb"
+        return
+    fi
+
+    if [[ "$file_info" =~ "U-Boot" ]]; then
+        echo "uboot"
+        return
+    fi
+
+    echo "unknown"
+}
+
+try_unpack_inner() {
+    local dir="$1"
+    local file
+    local base
+    local type
+
+    for file in "$dir"/*; do
+        [ -f "$file" ] || continue
+        local afile
+        afile=$(readlink -f "$file")
+        base=$(basename "$file")
+        type=$(file -b "$file")
+        local dest
+        local rc
+
+        if echo "$type" | grep -qi "gzip compressed"; then
+            dest="${afile}-unpack"
+            echo "  ==> Unpacking gzip: $base -> $(basename "$dest")/"
+            mkdir -p "$dest"
+            cd "$dest"
+            zcat "$afile" 2>/dev/null | cpio -idm --quiet 2>/dev/null
+            rc=${PIPESTATUS[1]}
+            cd "$WORKDIR"
+            if [ "$rc" -ne 0 ] && [ ! "$(ls -A "$dest" 2>/dev/null)" ]; then
+                echo "    Warning: gzip/cpio extraction failed for $base"
+                rmdir "$dest" 2>/dev/null
+            elif [ "$(ls -A "$dest" 2>/dev/null)" ]; then
+                try_unpack_inner "$dest"
+            else
+                rmdir "$dest" 2>/dev/null
+            fi
+        elif echo "$type" | grep -qi "cpio archive"; then
+            dest="${afile}-unpack"
+            echo "  ==> Unpacking cpio: $base -> $(basename "$dest")/"
+            mkdir -p "$dest"
+            cd "$dest"
+            cpio -idm --quiet < "$afile" 2>/dev/null
+            rc=$?
+            cd "$WORKDIR"
+            if [ "$rc" -ne 0 ] && [ ! "$(ls -A "$dest" 2>/dev/null)" ]; then
+                echo "    Warning: cpio extraction failed for $base"
+                rmdir "$dest" 2>/dev/null
+            elif [ "$(ls -A "$dest" 2>/dev/null)" ]; then
+                try_unpack_inner "$dest"
+            else
+                rmdir "$dest" 2>/dev/null
+            fi
+        elif echo "$type" | grep -qi "XZ compressed"; then
+            dest="${afile}-unpack"
+            echo "  ==> Unpacking xz: $base -> $(basename "$dest")/"
+            mkdir -p "$dest"
+            cd "$dest"
+            xzcat "$afile" 2>/dev/null | cpio -idm --quiet 2>/dev/null
+            rc=${PIPESTATUS[1]}
+            cd "$WORKDIR"
+            if [ "$rc" -ne 0 ] && [ ! "$(ls -A "$dest" 2>/dev/null)" ]; then
+                echo "    Warning: xz/cpio extraction failed for $base"
+                rmdir "$dest" 2>/dev/null
+            elif [ "$(ls -A "$dest" 2>/dev/null)" ]; then
+                try_unpack_inner "$dest"
+            else
+                rmdir "$dest" 2>/dev/null
+            fi
+        elif echo "$type" | grep -qi "bzip2 compressed"; then
+            dest="${afile}-unpack"
+            echo "  ==> Unpacking bzip2: $base -> $(basename "$dest")/"
+            mkdir -p "$dest"
+            cd "$dest"
+            bzcat "$afile" 2>/dev/null | cpio -idm --quiet 2>/dev/null
+            rc=${PIPESTATUS[1]}
+            cd "$WORKDIR"
+            if [ "$rc" -ne 0 ] && [ ! "$(ls -A "$dest" 2>/dev/null)" ]; then
+                echo "    Warning: bzip2/cpio extraction failed for $base"
+                rmdir "$dest" 2>/dev/null
+            elif [ "$(ls -A "$dest" 2>/dev/null)" ]; then
+                try_unpack_inner "$dest"
+            else
+                rmdir "$dest" 2>/dev/null
+            fi
+        elif echo "$type" | grep -qi "LZ4 compressed"; then
+            dest="${afile}-unpack"
+            echo "  ==> Unpacking lz4: $base -> $(basename "$dest")/"
+            mkdir -p "$dest"
+            cd "$dest"
+            lz4 -d -c "$afile" 2>/dev/null | cpio -idm --quiet 2>/dev/null
+            rc=${PIPESTATUS[1]}
+            cd "$WORKDIR"
+            if [ "$rc" -ne 0 ] && [ ! "$(ls -A "$dest" 2>/dev/null)" ]; then
+                echo "    Warning: lz4/cpio extraction failed for $base"
+                rmdir "$dest" 2>/dev/null
+            elif [ "$(ls -A "$dest" 2>/dev/null)" ]; then
+                try_unpack_inner "$dest"
+            else
+                rmdir "$dest" 2>/dev/null
+            fi
+        elif echo "$type" | grep -qi "device tree Blob"; then
+            local dtsfile="${afile}.dts"
+            echo "  ==> Converting DTB: $base -> $(basename "$dtsfile")"
+            dtc -I dtb -O dts -o "$dtsfile" "$afile" 2>/dev/null
+        fi
+    done
+}
+
+unpack_inner() {
+    local outdir="$1"
+    [ -d "$outdir" ] || return
+    try_unpack_inner "$outdir"
+}
+
+unpack_update() {
+    local img="$1"
+    local outdir="$2"
+
+    echo "==> Detected: update.img (rkImageMaker format)"
+
+    if [ -z "$outdir" ]; then
+        outdir=$(default_outdir "$img")
+    fi
+
+    mkdir -p "$outdir"
+    rkImageMaker -unpack "$img" "$outdir"
+    mkdir -p "$outdir/image"
+    if [ -f "$outdir/firmware.img" ]; then
+        afptool -unpack "$outdir/firmware.img" "$outdir/image"
+    fi
+
+    echo "==> Unpacked to: $outdir"
+    ls -alh "$outdir"
+    if [ -d "$outdir/image" ]; then
+        ls -alh "$outdir/image"
+    fi
+    unpack_inner "$outdir"
+}
+
+unpack_boot_android() {
+    local img="$1"
+    local outdir="$2"
+
+    echo "==> Detected: Android bootimg"
+
+    if [ -z "$outdir" ]; then
+        outdir=$(default_outdir "$img")
+    fi
+
+    mkdir -p "$outdir"
+    unpack_bootimg --boot_img "$img" --out "$outdir"
+    if [ -f "$outdir/second" ]; then
+        local saved_pwd=$(pwd)
+        cd "$outdir"
+        resource_tool --unpack --image=second
+        if [ -d "out" ]; then
+            mv out/* . 2>/dev/null
+            rmdir out 2>/dev/null
+        fi
+        cd "$saved_pwd"
+    fi
+
+    echo "==> Unpacked to: $outdir"
+    tree "$outdir" 2>/dev/null || ls -alhR "$outdir"
+    unpack_inner "$outdir"
+}
+
+unpack_boot_dtb() {
+    local img="$1"
+    local outdir="$2"
+
+    echo "==> Detected: Device Tree Blob (FIT) boot image"
+
+    if [ -z "$outdir" ]; then
+        outdir=$(default_outdir "$img")
+    fi
+
+    mkdir -p "$outdir"
+
+    local idx=0
+    while dumpimage "$img" -T flat_dt -p $idx -o "$outdir/part_$idx" 2>/dev/null; do
+        local part_name
+        part_name=$(dumpimage -l "$img" -T flat_dt 2>/dev/null | grep "Image $idx" | sed -n 's/.*(\(.*\)).*/\1/p')
+        if [ -n "$part_name" ]; then
+            mv "$outdir/part_$idx" "$outdir/$part_name"
+        fi
+        idx=$((idx + 1))
+    done
+
+    if [ -f "$outdir/resource" ]; then
+        local saved_pwd=$(pwd)
+        cd "$outdir"
+        resource_tool --unpack --image=resource
+        if [ -d "out" ]; then
+            mv out/* . 2>/dev/null
+            rmdir out 2>/dev/null
+        fi
+        cd "$saved_pwd"
+    fi
+
+    echo "==> Unpacked to: $outdir"
+    tree "$outdir" 2>/dev/null || ls -alhR "$outdir"
+    unpack_inner "$outdir"
+}
+
+unpack_uboot() {
+    local img="$1"
+    local outdir="$2"
+
+    echo "==> Detected: U-Boot image"
+
+    if [ -z "$outdir" ]; then
+        outdir=$(default_outdir "$img")
+    fi
+
+    mkdir -p "$outdir"
+
+    dumpimage -l "$img" > "$outdir/image_info.txt"
+
+    dumpimage -l "$img" | grep 'Image' | while read line; do
+        if [[ $line =~ ^Image[[:space:]]+([0-9]+)[[:space:]]+\((.+)\) ]]; then
+            local num="${BASH_REMATCH[1]}"
+            local name="${BASH_REMATCH[2]}"
+            local output_file="$outdir/$name"
+
+            echo "  Extracting Image $num ($name) -> $output_file"
+            dumpimage "$img" -T flat_dt -p "$num" -o "$output_file"
+        fi
+    done
+
+    echo "==> Unpacked to: $outdir"
+    ls -alh "$outdir"
+    file "$outdir"/* 2>/dev/null
+    unpack_inner "$outdir"
+}
+
+unpack_resource() {
+    local img="$1"
+    local outdir="$2"
+
+    echo "==> Detected: Resource image"
+
+    if [ -z "$outdir" ]; then
+        outdir=$(default_outdir "$img")
+    fi
+
+    mkdir -p "$outdir"
+
+    local saved_pwd=$(pwd)
+    cd "$outdir"
+    resource_tool --verbose --unpack --image="$img"
+    if [ -d "out" ]; then
+        mv out/* . 2>/dev/null
+        rmdir out 2>/dev/null
+    fi
+    cd "$saved_pwd"
+
+    echo "==> Unpacked to: $outdir"
+    ls -alh "$outdir"
+    file "$outdir"/* 2>/dev/null
+    unpack_inner "$outdir"
+}
+
+process_image() {
+    local img="$1"
+    local outdir="$2"
+
+    if [ ! -f "$img" ]; then
+        echo "Error: $img not found or not a regular file, skipping"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        return
+    fi
+
+    IMAGE_TYPE=$(detect_image_type "$img")
+
+    case "$IMAGE_TYPE" in
+        update)
+            unpack_update "$img" "$outdir"
+            ;;
+        boot-android)
+            unpack_boot_android "$img" "$outdir"
+            ;;
+        boot-dtb)
+            unpack_boot_dtb "$img" "$outdir"
+            ;;
+        uboot)
+            unpack_uboot "$img" "$outdir"
+            ;;
+        resource)
+            unpack_resource "$img" "$outdir"
+            ;;
+        *)
+            file_info=$(file -b "$img")
+            info_file="${img}.info"
+            {
+                echo "File: $img"
+                echo "Size: $(ls -lh "$img" | awk '{print $5}')"
+                echo "MD5:  $(md5sum "$img" | awk '{print $1}')"
+                echo ""
+                echo "=== file info ==="
+                echo "$file_info"
+                echo ""
+                echo "=== hexdump (first 10 lines) ==="
+                hexdump -C "$img" | head -10
+                echo ""
+                echo "=== binwalk ==="
+                binwalk "$img"
+            } > "$info_file"
+            echo "Warning: Unknown or unsupported image type"
+            echo "  File: $img"
+            echo "  file(1) output: $file_info"
+            echo ""
+            cat "$info_file"
+            echo ""
+            echo "==> Info saved to: $info_file"
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            ;;
+    esac
+}
+
+if [ $# -gt 1 ] && [ -n "$OUTPUT_DIR" ]; then
+    echo "Warning: -o/--output ignored when processing multiple files (would cause overwrites)"
+    OUTPUT_DIR=""
+fi
+
+TOTAL=$#
+
+for img in "$@"; do
+    if [ -d "$img" ]; then
+        continue
+    fi
+    echo "========================================"
+    echo "Processing: $img"
+    echo "========================================"
+    process_image "$img" "$OUTPUT_DIR"
+    echo ""
+done
+
+if [ $FAIL_COUNT -gt 0 ]; then
+    echo "Done with $FAIL_COUNT error(s) out of $TOTAL file(s)"
+    exit 1
+fi
+
+echo "All $TOTAL file(s) unpacked successfully!"
