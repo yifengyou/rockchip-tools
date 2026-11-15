@@ -50,7 +50,7 @@ cmd/rkttl-gui/rsrc_windows_amd64.syso: rkttl.ico cmd/rkttl-gui/app.manifest
 		-o cmd/rkttl-gui/rsrc_windows_amd64.syso
 
 test:
-	go test ./internal/... -count=1
+	go test ./internal/... ./cmd/rkttl-gui -count=1
 
 vet:
 	go vet ./cmd/rkttl ./internal/...

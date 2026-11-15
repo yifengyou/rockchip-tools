@@ -2,6 +2,8 @@
 bin/
 rkttl.exe
 rkttl-gui.exe
+# GUI 本地状态（主题等）
+rkttl-gui.json
 
 # Go
 *.test

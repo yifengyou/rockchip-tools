@@ -18,7 +18,6 @@ button:hover { background:#3a4046; }
 button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
 button.primary:hover { background:#5cb47d; }
 button:disabled { opacity:.5; cursor:default; }
-button.helpbtn { padding:2px 9px; font-weight:700; border-radius:50%; }
 .spacer { flex:1; }
 #statusbar { font-size:12px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 #console-wrap { flex:1; overflow:hidden; display:flex; padding:6px 0; }
@@ -36,6 +35,10 @@ button.helpbtn { padding:2px 9px; font-weight:700; border-radius:50%; }
 #console.focus #cursor { animation: blink 1.1s steps(1) infinite; }
 #cursor { color:#9ec97f; }
 @keyframes blink { 50% { opacity:0; } }
+/* VT 网格视图（htop/top 全屏应用） */
+#vtgrid { min-height:100%; }
+.vtline { display:block; min-height:1.45em; }
+.vcur { color:#9ec97f; animation: blink 1.1s steps(1) infinite; }
 footer { background:var(--panel); border-top:1px solid #333; padding:5px 12px; display:flex; flex-wrap:wrap; gap:10px; align-items:center;
   font-size:12px; color:var(--dim); cursor:pointer; }
 footer kbd { background:#1a1c1e; border:1px solid #3a3e42; border-bottom-width:2px; border-radius:3px; padding:0 5px; font-size:11px; }
@@ -69,7 +72,7 @@ footer kbd { background:#1a1c1e; border:1px solid #3a3e42; border-bottom-width:2
   <button id="hexBtn" title="输入十六进制字节串发送（如 0d0a41）">HEX</button>
   <button id="ctrlc" title="发送 0x03 中断信号">Ctrl+C</button>
   <button id="clearBtn" title="仅清空屏幕显示（保留日志与缓冲）">清屏</button>
-  <button id="helpBtn" class="helpbtn" title="Linux/远端如何连接（nc / socat / TCP 桥）">?</button>
+  <button id="helpBtn" title="Linux/远端如何连接（nc / socat / TCP 桥）">帮助</button>
   <label class="inline" title="新输出到达时自动滚动到底部"><input type="checkbox" id="autoscroll" checked>自动滚动</label>
   <span class="spacer"></span>
   <span id="statusbar">连接中…</span>
@@ -78,7 +81,7 @@ footer kbd { background:#1a1c1e; border:1px solid #3a3e42; border-bottom-width:2
 <footer id="hintbar" title="点击聚焦终端">
   终端已直连串口 —— 直接输入命令，<kbd>Enter</kbd> 发送 ·
   <kbd>Ctrl+C</kbd> 中断 · <kbd>Tab</kbd>/<kbd>Esc</kbd>/<kbd>Ctrl+D</kbd>/<kbd>Ctrl+U</kbd> 透传 ·
-  粘贴将逐行执行 · 点击右上 <b>?</b> 查看远端接入方式
+  粘贴将逐行执行 · 点击右上 <b>帮助</b> 查看远端接入方式
 </footer>
 <div id="toast"></div>
 <div id="helpmask">
@@ -148,6 +151,592 @@ var CONSOLE_CAP = 1024 * 1024;
 
 var FG = {30:"#6a6a6a",31:"#e06c75",32:"#98c379",33:"#e5c07b",34:"#61afef",35:"#c678dd",36:"#56b6c2",37:"#abb2bf",
           90:"#5c6370",91:"#ff6b6b",92:"#9ec97f",93:"#f0d28c",94:"#77b5f5",95:"#d78ce0",96:"#6fd3d3",97:"#ffffff"};
+var BG = {40:"#3f4245",41:"#5c3737",42:"#374537",43:"#454037",44:"#373f45",45:"#453745",46:"#374545",47:"#454545",
+          100:"#5c6370",101:"#6e3a3a",102:"#3a4a3a",103:"#4a443a",104:"#3a404a",105:"#4a3a4a",106:"#3a4a4a",107:"#8a8a8a"};
+
+// ---------- VT 屏幕引擎（htop/top 等全屏光标寻址应用） ----------
+// 与 internal/vt（Go 版）同构：网格屏幕 + 光标寻址 + 滚动区域 +
+// alt screen；此 JS 版额外维护 SGR 颜色属性（反色/加粗/前后景）。
+// 属性编码：attr = fg(1-16) | bg<<4 | bold<<8 | rev<<9（0 = 默认）。
+function VtScreen(cols, rows) {
+  this.cols = cols; this.rows = rows;
+  this.lines = [{ t: "", a: null }];
+  this.alt = [];
+  for (var i = 0; i < rows; i++) this.alt.push({ t: "", a: null });
+  this.altActive = false;
+  this.cx = 0; this.cy = 0; this.acx = 0; this.acy = 0;
+  this.saved = { x: 0, y: 0 };
+  this.top = 0; this.bot = 0;
+  this.wrapOn = true; this.pendingWrap = false;
+  this.marks = [];   // 最近的全屏特征序列时间戳
+  this.esc = ""; this.inOSC = false;
+  this.attr = 0;
+}
+
+VtScreen.prototype.newLine = function () { return { t: "", a: null }; };
+VtScreen.prototype.markFullScreen = function () {
+  this.marks.push(Date.now());
+  var cut = Date.now() - 2500;
+  this.marks = this.marks.filter(function (t) { return t >= cut; });
+  if (this.marks.length > 16) this.marks = this.marks.slice(-16);
+};
+// fullScreenActive：备用屏激活，或 2.5s 内 ≥4 次特征序列（持续帧重绘）；
+// 普通 shell 的行编辑/单次 clear 不会误触发。
+VtScreen.prototype.fullScreenActive = function () {
+  if (this.altActive) return true;
+  var cut = Date.now() - 2500, n = 0;
+  for (var i = this.marks.length - 1; i >= 0; i--) {
+    if (this.marks[i] < cut) break;
+    n++;
+  }
+  return n >= 4;
+};
+
+VtScreen.prototype.feed = function (str) {
+  if (this.esc !== "") { str = this.esc + str; this.esc = ""; }
+  var rs = Array.from(str);
+  var i = 0;
+  while (i < rs.length) {
+    if (this.inOSC) {
+      var j = i;
+      for (; j < rs.length; j++) {
+        if (rs[j] === "\x07") { this.inOSC = false; i = j + 1; break; }
+        if (rs[j] === "\x1b" && j + 1 < rs.length && rs[j+1] === "\\") { this.inOSC = false; i = j + 2; break; }
+      }
+      if (this.inOSC) { this.esc = rs.slice(i).join(""); return; }
+      continue;
+    }
+    var r = rs[i];
+    if (r === "\x1b") {
+      var st = this.parseEscape(rs, i);
+      if (st < 0) { this.esc = rs.slice(i).join(""); return; }
+      i = st;
+      continue;
+    }
+    this.putRune(r);
+    i++;
+  }
+};
+
+VtScreen.prototype.putRune = function (r) {
+  var c = r.charCodeAt(0);
+  if (c < 0x20 || c === 0x7f) { this.putCtrl(c); return; }
+  if (this.pendingWrap && this.wrapOn) {
+    this.pendingWrap = false;
+    this.newlineSoft();
+  }
+  var x = this.colX();
+  var line = this.curLineFor(x);
+  if (x >= line.t.length) line.t = line.t + " ".repeat(x - line.t.length);
+  line.t = line.t.slice(0, x) + r + line.t.slice(x + r.length);
+  this.setCellAttr(line, x, this.attr, r.length);
+  var nx = x + 1;
+  if (nx >= this.cols) {
+    this.pendingWrap = true;
+    this.setCol(this.cols - 1);
+  } else {
+    this.setCol(nx);
+  }
+};
+
+VtScreen.prototype.putCtrl = function (c) {
+  switch (c) {
+    case 10: this.lineFeed(); break;
+    case 13: this.setCol(0); break;
+    case 8:
+      if (this.colX() > 0) this.setCol(this.colX() - 1);
+      break;
+    case 9:
+      var nx = (Math.floor(this.colX() / 8) + 1) * 8;
+      this.setCol(Math.min(nx, this.cols - 1));
+      break;
+  }
+};
+
+VtScreen.prototype.colX = function () { return this.altActive ? this.acx : this.cx; };
+VtScreen.prototype.setCol = function (x) {
+  x = Math.max(0, Math.min(x, this.cols - 1));
+  if (this.altActive) this.acx = x; else this.cx = x;
+};
+VtScreen.prototype.setRowView = function (y) {
+  y = Math.max(0, y);
+  if (this.altActive) { this.acy = Math.min(y, this.rows - 1); return; }
+  var top = this.viewTop();
+  var abs = top + y;
+  while (abs >= this.lines.length) this.lines.push(this.newLine());
+  this.cy = abs;
+};
+VtScreen.prototype.viewTop = function () {
+  return Math.max(0, this.lines.length - this.rows);
+};
+
+VtScreen.prototype.curLineFor = function (x) {
+  if (this.altActive) {
+    var L = this.alt[this.acy];
+    if (L.t.length < x) L.t = L.t + " ".repeat(x - L.t.length);
+    return L;
+  }
+  while (this.cy >= this.lines.length) this.lines.push(this.newLine());
+  var P = this.lines[this.cy];
+  if (P.t.length < x) P.t = P.t + " ".repeat(x - P.t.length);
+  return P;
+};
+
+VtScreen.prototype.newlineSoft = function () { this.lineFeedRaw(); this.setCol(0); };
+VtScreen.prototype.lineFeed = function () { this.lineFeedRaw(); };
+VtScreen.prototype.lineFeedRaw = function () {
+  if (this.altActive) {
+    if (this.acy < this.scrollBottom()) this.acy++;
+    else this.scrollUp(1);
+    return;
+  }
+  this.cy++;
+  while (this.cy >= this.lines.length) this.lines.push(this.newLine());
+};
+
+VtScreen.prototype.scrollTop = function () { return this.top > 0 ? this.top - 1 : 0; };
+VtScreen.prototype.scrollBottom = function () { return this.bot > 0 ? this.bot - 1 : this.rows - 1; };
+
+VtScreen.prototype.scrollUp = function (n) {
+  var t, b;
+  if (this.altActive) { t = this.scrollTop(); b = this.scrollBottom(); }
+  else { t = this.viewTop() + this.scrollTop(); b = this.viewTop() + this.scrollBottom(); }
+  var arr = this.linesOrAlt();
+  if (b >= arr.length) return;
+  for (var k = 0; k < n; k++) {
+    for (var y = t; y < b; y++) arr[y] = arr[y + 1];
+    arr[b] = this.newLine();
+  }
+};
+VtScreen.prototype.scrollDown = function (n) {
+  var t, b;
+  if (this.altActive) { t = this.scrollTop(); b = this.scrollBottom(); }
+  else { t = this.viewTop() + this.scrollTop(); b = this.viewTop() + this.scrollBottom(); }
+  var arr = this.linesOrAlt();
+  if (b >= arr.length) return;
+  for (var k = 0; k < n; k++) {
+    for (var y = b; y > t; y--) arr[y] = arr[y - 1];
+    arr[t] = this.newLine();
+  }
+};
+VtScreen.prototype.linesOrAlt = function () { return this.altActive ? this.alt : this.lines; };
+
+VtScreen.prototype.eraseLine = function (mode) {
+  var line = this.curLineFor(this.colX());
+  var c = this.colX();
+  if (mode === 0) {
+    line.t = line.t.slice(0, c);
+    this.trimAttrs(line, c);
+  } else if (mode === 1) {
+    var head = " ".repeat(Math.min(c + 1, line.t.length));
+    line.t = head + line.t.slice(c + 1);
+    this.padAttrs(line, line.t.length);
+  } else if (mode === 2) {
+    line.t = ""; line.a = null;
+  }
+};
+
+VtScreen.prototype.eraseDisplay = function (mode) {
+  var arr = this.linesOrAlt(), i;
+  if (this.altActive) {
+    if (mode === 0) {
+      this.eraseLine(0);
+      for (i = this.acy + 1; i < this.rows; i++) arr[i] = this.newLine();
+    } else if (mode === 1) {
+      for (i = 0; i < this.acy; i++) arr[i] = this.newLine();
+      this.eraseLine(1);
+    } else {
+      for (i = 0; i < this.rows; i++) arr[i] = this.newLine();
+    }
+    return;
+  }
+  var top = this.viewTop();
+  if (mode === 0) {
+    this.eraseLine(0);
+    for (i = this.cy + 1; i < this.lines.length; i++) this.lines[i] = this.newLine();
+  } else if (mode === 1) {
+    for (i = top; i < this.cy; i++) this.lines[i] = this.newLine();
+    this.eraseLine(1);
+  } else {
+    for (i = top; i < this.lines.length; i++) this.lines[i] = this.newLine();
+  }
+};
+
+// setCellAttr/trimAttrs/padAttrs 维护行属性数组（与文本 code unit 对齐）
+VtScreen.prototype.setCellAttr = function (line, x, attr, len) {
+  if (attr === 0 && line.a === null) return;
+  if (line.a === null) {
+    if (attr === 0) return;
+    line.a = new Array(line.t.length).fill(0);
+  }
+  while (line.a.length < line.t.length) line.a.push(0);
+  for (var k = 0; k < len; k++) line.a[x + k] = attr;
+};
+VtScreen.prototype.trimAttrs = function (line, from) {
+  if (line.a) line.a.length = Math.min(line.a.length, from);
+};
+VtScreen.prototype.padAttrs = function (line, to) {
+  if (line.a) while (line.a.length < to) line.a.push(0);
+};
+
+VtScreen.prototype.parseEscape = function (rs, i) {
+  if (i + 1 >= rs.length) return -1;
+  switch (rs[i+1]) {
+    case "[":
+      var j = i + 2, priv = "";
+      if (j < rs.length && "?><=".indexOf(rs[j]) >= 0) { priv = rs[j]; j++; }
+      var start = j;
+      while (j < rs.length) {
+        var fc = rs[j].charCodeAt(0);
+        if (fc >= 0x40 && fc <= 0x7e) {
+          this.execCSI(priv, rs.slice(start, j).join(""), rs[j]);
+          return j + 1;
+        }
+        j++;
+      }
+      return -1;
+    case "]":
+      var k = i + 2;
+      for (; k < rs.length; k++) {
+        if (rs[k] === "\x07") return k + 1;
+        if (rs[k] === "\x1b" && k + 1 < rs.length && rs[k+1] === "\\") return k + 2;
+      }
+      this.inOSC = true;
+      return i + 2;
+    case "7": this.saveCursor(); return i + 2;
+    case "8": this.restoreCursor(); return i + 2;
+    case "D": this.lineFeedRaw(); return i + 2;
+    case "E": this.lineFeedRaw(); this.setCol(0); return i + 2;
+    case "M":
+      if (this.altActive) {
+        if (this.acy > this.scrollTop()) this.acy--;
+        else this.scrollDown(1);
+      }
+      return i + 2;
+    case "c":
+      for (var z = 0; z < this.rows; z++) this.alt[z] = this.newLine();
+      this.altActive = false;
+      this.cx = 0; this.cy = 0; this.acx = 0; this.acy = 0;
+      this.top = 0; this.bot = 0;
+      return i + 2;
+    default: return i + 2;
+  }
+};
+
+VtScreen.prototype.saveCursor = function () {
+  this.saved = this.altActive ? { x: this.acx, y: this.acy } : { x: this.cx, y: this.cy };
+};
+VtScreen.prototype.restoreCursor = function () {
+  if (this.altActive) { this.acx = this.saved.x; this.acy = this.saved.y; }
+  else { this.cx = this.saved.x; this.cy = this.saved.y; }
+};
+
+VtScreen.prototype.execCSI = function (priv, params, fin) {
+  var ps = params === "" ? [] : params.split(";");
+  var self = this;
+  var n1 = function (d) { return ps.length && ps[0] !== "" ? self.atoi(ps[0], d) : d; };
+  var n2 = function (d) { return ps.length > 1 && ps[1] !== "" ? self.atoi(ps[1], d) : d; };
+
+  switch (fin) {
+    case "H": case "f":
+      this.markFullScreen();
+      this.setCol(n2(1) - 1);
+      this.setRowView(n1(1) - 1);
+      break;
+    case "A":
+      if (this.altActive) this.acy -= n1(1); else this.cy -= n1(1);
+      this.clampCursor(); break;
+    case "B":
+      if (this.altActive) this.acy += n1(1); else this.cy += n1(1);
+      this.clampCursor(); break;
+    case "C": this.setCol(this.colX() + n1(1)); break;
+    case "D": this.setCol(this.colX() - n1(1)); break;
+    case "E": if (this.altActive) this.acy += n1(1); this.setCol(0); this.clampCursor(); break;
+    case "F": if (this.altActive) this.acy -= n1(1); this.setCol(0); this.clampCursor(); break;
+    case "G": case "`": this.setCol(n1(1) - 1); break;
+    case "d": if (this.altActive) { this.acy = n1(1) - 1; this.clampCursor(); } break;
+    case "J": this.markFullScreen(); this.eraseDisplay(n1(0)); break;
+    case "K": this.eraseLine(n1(0)); break;
+    case "L": this.markFullScreen(); if (this.altActive) this.insertDeleteAt(n1(1), true); break;
+    case "M": this.markFullScreen(); if (this.altActive) this.insertDeleteAt(n1(1), false); break;
+    case "S": this.markFullScreen(); this.scrollUp(n1(1)); break;
+    case "T": this.markFullScreen(); this.scrollDown(n1(1)); break;
+    case "r":
+      if (priv === "") {
+        this.markFullScreen();
+        this.top = n1(1); this.bot = n2(this.rows);
+        if (this.altActive) { this.acx = 0; this.acy = this.scrollTop(); }
+      }
+      break;
+    case "m": this.applySGR(ps); break;
+    case "h": case "l":
+      if (priv === "?") {
+        var v = n1(0);
+        if (v === 47 || v === 1047 || v === 1049) {
+          if (fin === "h" && !this.altActive) {
+            this.markFullScreen();
+            for (var z = 0; z < this.rows; z++) this.alt[z] = this.newLine();
+            this.altActive = true; this.acx = 0; this.acy = 0;
+          } else if (fin === "l" && this.altActive) {
+            this.markFullScreen();
+            this.altActive = false;
+          }
+        } else if (v === 7) {
+          this.wrapOn = fin === "h";
+        }
+      }
+      break;
+    case "s": this.saveCursor(); break;
+    case "u": this.restoreCursor(); break;
+  }
+};
+
+VtScreen.prototype.insertDeleteAt = function (n, isInsert) {
+  var t = this.acy, b = this.scrollBottom();
+  for (var k = 0; k < n; k++) {
+    if (isInsert) { for (var y = b; y > t; y--) this.alt[y] = this.alt[y-1]; this.alt[t] = this.newLine(); }
+    else { for (var y = t; y < b; y++) this.alt[y] = this.alt[y+1]; this.alt[b] = this.newLine(); }
+  }
+};
+
+VtScreen.prototype.clampCursor = function () {
+  if (this.altActive) this.acy = Math.max(0, Math.min(this.acy, this.rows - 1));
+  else {
+    this.cy = Math.max(0, this.cy);
+    while (this.cy >= this.lines.length) this.lines.push(this.newLine());
+  }
+};
+
+// applySGR 处理颜色属性（fg 1-16 = 30-37/90-97，bg 同理，反色/加粗）。
+VtScreen.prototype.applySGR = function (ps) {
+  var i = 0;
+  while (i < ps.length) {
+    var p = this.atoi(ps[i] || "0", 0);
+    if (p === 0) { this.attr = 0; }
+    else if (p === 1) this.attr |= 1 << 8;
+    else if (p === 22) this.attr &= ~(1 << 8);
+    else if (p === 7) this.attr |= 1 << 9;
+    else if (p === 27) this.attr &= ~(1 << 9);
+    else if (p === 39) this.attr &= 0xf0;
+    else if (p === 49) this.attr &= 0x0f;
+    else if (p >= 30 && p <= 37) this.attr = (this.attr & ~0x0f) | (p - 29);
+    else if (p >= 90 && p <= 97) this.attr = (this.attr & ~0x0f) | (p - 89);
+    else if (p >= 40 && p <= 47) this.attr = (this.attr & ~0xf0) | ((p - 39) << 4);
+    else if (p >= 100 && p <= 107) this.attr = (this.attr & ~0xf0) | ((p - 99) << 4);
+    else if (p === 38 && ps[i+1] === "5") i += 2; // 256 色：跳过
+    else if (p === 48 && ps[i+1] === "5") i += 2;
+    i++;
+  }
+};
+
+VtScreen.prototype.atoi = function (s, def) {
+  var n = 0;
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charCodeAt(i);
+    if (c < 0x30 || c > 0x39) return def;
+    n = n * 10 + (c - 0x30);
+  }
+  return n === 0 ? def : n;
+};
+
+// renderLines 返回可视行（含分段属性），供网格视图渲染。
+VtScreen.prototype.renderLines = function () {
+  var arr, out = [];
+  if (this.altActive) {
+    for (var y = 0; y < this.rows; y++) out.push(this.lineRuns(this.alt[y]));
+    return { lines: out, cursor: { x: this.acx, y: this.acy, on: this.altActive } };
+  }
+  var top = this.viewTop();
+  var end = this.lines.length;
+  while (end > top + 1 && this.lines[end-1].t.trim() === "") end--;
+  for (var y2 = top; y2 < end; y2++) out.push(this.lineRuns(this.lines[y2]));
+  return { lines: out, cursor: { x: this.cx, y: this.cy - top, on: false } };
+};
+
+VtScreen.prototype.lineRuns = function (line) {
+  var t = line.t;
+  var runs = [];
+  if (!line.a) { runs.push({ t: t, attr: 0 }); return runs; }
+  var curAttr = -1, start = 0;
+  for (var i = 0; i <= t.length; i++) {
+    var at = i < line.a.length ? (line.a[i] || 0) : 0;
+    if (at !== curAttr) {
+      if (curAttr >= 0 && i > start) runs.push({ t: t.slice(start, i), attr: curAttr });
+      curAttr = at; start = i;
+    }
+  }
+  if (curAttr >= 0 && start < t.length) runs.push({ t: t.slice(start), attr: curAttr });
+  if (!runs.length) runs.push({ t: "", attr: 0 });
+  return runs;
+};
+
+// dumpText 返回主屏可视文本（退出全屏时接回流式视图）。
+VtScreen.prototype.dumpText = function () {
+  var top = this.viewTop();
+  var end = this.lines.length;
+  while (end > top + 1 && this.lines[end-1].t.trim() === "") end--;
+  var out = [];
+  for (var y = top; y < end; y++) out.push(this.lines[y].t.replace(/\s+$/, ""));
+  return out.join("\n");
+};
+
+// ---------- 双视图协调：流式视图 ⇄ VT 网格视图 ----------
+// htop/top 等全屏程序激活时，网格视图接管终端（行级 diff 渲染）；
+// 退出后流式视图恢复，VT 主屏期间的内容接回。
+var vtScreen = new VtScreen(80, 24);
+var vtMode = false;
+var vtGridEl = null, vtRowEls = [], vtRowKeys = [];
+var streamSaved = []; // 流式子节点（含 inputline）暂存
+var vtEnterDump = ""; // 进入全屏时的主屏文本（退出时只接增量）
+
+function ensureVTGrid() {
+  if (vtGridEl && vtGridEl.parentNode === consoleEl) return;
+  vtGridEl = document.createElement("div");
+  vtGridEl.id = "vtgrid";
+  vtRowEls = [];
+  vtRowKeys = [];
+}
+
+function enterVT() {
+  vtMode = true;
+  ensureVTGrid();
+  vtEnterDump = vtScreen.dumpText();
+  streamSaved = Array.prototype.slice.call(consoleEl.childNodes);
+  for (var i = streamSaved.length - 1; i >= 0; i--) consoleEl.removeChild(streamSaved[i]);
+  consoleEl.appendChild(vtGridEl);
+  renderVT();
+  toast("全屏程序已接管屏幕：键盘直接发送（方向键/F 键/q），退出后自动恢复");
+}
+
+function exitVT() {
+  vtMode = false;
+  if (vtGridEl && vtGridEl.parentNode === consoleEl) consoleEl.removeChild(vtGridEl);
+  vtGridEl = null; vtRowEls = []; vtRowKeys = [];
+  for (var i = 0; i < streamSaved.length; i++) consoleEl.appendChild(streamSaved[i]);
+  streamSaved = [];
+  // 只把 VT 期间主屏新增的内容接回流式视图（进入前的内容已在流式 DOM 中）
+  var now = vtScreen.dumpText();
+  if (now.length > vtEnterDump.length && now.slice(0, vtEnterDump.length) === vtEnterDump) {
+    putText(now.slice(vtEnterDump.length));
+  } else if (now !== vtEnterDump) {
+    putText(now + "\n"); // 主屏被改写（罕见）：全量接回
+  }
+  toast("已退出全屏程序，恢复流式终端");
+}
+
+// renderVT 行级 diff 渲染网格（含光标指示）。
+function renderVT() {
+  ensureVTGrid();
+  var r = vtScreen.renderLines();
+  while (vtRowEls.length < r.lines.length) {
+    var div = document.createElement("div");
+    div.className = "vtline";
+    vtGridEl.appendChild(div);
+    vtRowEls.push(div);
+    vtRowKeys.push(null);
+  }
+  while (vtRowEls.length > r.lines.length) {
+    vtGridEl.removeChild(vtRowEls.pop());
+    vtRowKeys.pop();
+  }
+  for (var i = 0; i < r.lines.length; i++) {
+    var key = lineKey(r.lines[i]) + "\x03" + (r.cursor.on && r.cursor.y === i ? r.cursor.x : -1);
+    if (key !== vtRowKeys[i]) {
+      vtRowKeys[i] = key;
+      renderRow(vtRowEls[i], r.lines[i], r.cursor.on && r.cursor.y === i, r.cursor.x);
+    }
+  }
+}
+
+function lineKey(line) {
+  var k = "";
+  for (var i = 0; i < line.length; i++) k += line[i].attr + "\x01" + line[i].t + "\x02";
+  return k;
+}
+
+function renderRow(el, line, hasCursor, cursorX) {
+  while (el.firstChild) el.removeChild(el.firstChild);
+  for (var i = 0; i < line.length; i++) {
+    var run = line[i];
+    var span = document.createElement("span");
+    applyVTAttr(span, run.attr);
+    span.textContent = run.t;
+    el.appendChild(span);
+  }
+  if (hasCursor) {
+    var cur = document.createElement("span");
+    cur.className = "vcur";
+    cur.textContent = "\u258c";
+    el.appendChild(cur);
+  }
+}
+
+// applyVTAttr 把属性编码映射为 span 样式（反色 = 前后景交换）。
+function applyVTAttr(span, attr) {
+  if (!attr) return;
+  var fg = attr & 0x0f, bg = (attr >> 4) & 0x0f;
+  var bold = attr & 0x100, rev = attr & 0x200;
+  if (bold) span.className = "b";
+  var fgCode = fg ? (fg <= 8 ? 29 + fg : 89 + fg) : 0;
+  var bgCode = bg ? (bg <= 8 ? 39 + bg : 99 + bg) : 0;
+  if (rev) {
+    span.style.color = fgCode ? FG[fgCode] : "#1d1f21";
+    span.style.background = bgCode ? BG[bgCode] : "#c5c8c6";
+  } else {
+    if (fgCode) span.style.color = FG[fgCode];
+    if (bgCode) span.style.background = BG[bgCode];
+  }
+}
+
+// vtKeySeq 把按键映射为全屏模式应发送的终端序列；null = 交给默认行为。
+function vtKeySeq(e) {
+  switch (e.key) {
+    case "Enter": return "\r";
+    case "ArrowUp": return "\x1b[A";
+    case "ArrowDown": return "\x1b[B";
+    case "ArrowRight": return "\x1b[C";
+    case "ArrowLeft": return "\x1b[D";
+    case "PageUp": return "\x1b[5~";
+    case "PageDown": return "\x1b[6~";
+    case "Home": return "\x1b[H";
+    case "End": return "\x1b[F";
+    case "Delete": return "\x1b[3~";
+    case "Insert": return e.ctrlKey ? null : "\x1b[2~";
+    case "Backspace": return "\x08";
+    case "Tab": return "\t";
+    case "F1": return "\x1bOP";
+    case "F2": return "\x1bOQ";
+    case "F3": return "\x1bOR";
+    case "F4": return "\x1bOS";
+    case "F5": return "\x1b[15~";
+    case "F6": return "\x1b[17~";
+    case "F7": return "\x1b[18~";
+    case "F8": return "\x1b[19~";
+    case "F9": return "\x1b[20~";
+    case "F10": return "\x1b[21~";
+    case "F11": return "\x1b[23~";
+    case "F12": return "\x1b[24~";
+  }
+  if (e.ctrlKey && !e.altKey && !e.metaKey) {
+    switch (e.key.toLowerCase()) {
+      case "c": return "\x03";
+      case "d": return "\x04";
+      case "u": return "\x15";
+      case "z": return "\x1a";
+    }
+    return null;
+  }
+  if (e.key.length === 1 && !e.altKey && !e.metaKey) return e.key; // 字符直发
+  return null;
+}
+
+function toHex(s) {
+  var out = "";
+  for (var i = 0; i < s.length; i++) {
+    out += ("0" + s.charCodeAt(i).toString(16)).slice(-2);
+  }
+  return out;
+}
 
 // inputline：本地输入行（span#inputline 内含文本节点与光标）
 var inputlineSpan = null, inputText = null;
@@ -251,10 +840,10 @@ function autoScroll() {
   }
 }
 
-// renderChunk 渲染一个串口数据块；不完整的多字节 UTF-8 由 TextDecoder
-// 流式缓冲，不完整的 ANSI 序列由 ansiPending 缓冲到下一块
-function renderChunk(bytes) {
-  var s = ansiPending + dec.decode(bytes, { stream: true });
+// renderStreamChunk 执行流式视图渲染；不完整的 ANSI 序列由 ansiPending
+// 缓冲到下一块（与 VT 引擎的 esc 缓冲各自独立）
+function renderStreamChunk(s) {
+  s = ansiPending + s;
   ansiPending = "";
   var i = 0;
   while (i < s.length) {
@@ -278,8 +867,8 @@ function renderChunk(bytes) {
         i = (s.charCodeAt(end) === 27) ? end + 2 : end + 1;
       } else { i += 2; }
     } else if (c === 10) { putText("\n"); i++; }
-    else if (c === 13) { i++; }                          // \r 丢弃
-    else if (c === 8)  { backspace(); i++; }             // \b 退格（可跨块）
+    else if (c === 13) { i++; }                          // \r 由 VT 引擎处理（网格覆盖）
+    else if (c === 8)  { backspace(); i++; }             // \b 退格（流式近似）
     else if (c < 32)   { i++; }                          // 其他控制字符
     else { putText(s[i]); i++; }
   }
@@ -290,8 +879,22 @@ function appendData(b64) {
   var bin = atob(b64);
   var bytes = new Uint8Array(bin.length);
   for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  renderChunk(bytes);
-  autoScroll();
+  // UTF-8 流式解码一次，双路消费：
+  //   流式视图（现有 DOM）与 VT 屏幕引擎（全屏应用网格）
+  var s = dec.decode(bytes, { stream: true });
+  vtScreen.feed(s);               // VT 引擎（含自己的 esc 序列缓冲）
+  var fs = vtScreen.fullScreenActive();
+  if (fs) {
+    if (!vtMode) enterVT();       // 触发批不喂流式（网格接管）
+    renderVT();
+  } else {
+    if (vtMode) {
+      exitVT();                   // 退出批：dump 增量已含本批主屏内容，不再喂流式
+    } else {
+      renderStreamChunk(s);       // 流式渲染（含自己的 ansiPending 缓冲）
+    }
+    autoScroll();
+  }
 }
 
 function sysLine(text) {
@@ -329,13 +932,17 @@ function inputBackspace() {
 }
 
 // submitInput 发送本地输入行并清空之（显示交给设备回显）。
+// 空行回车也发送裸 CR —— 与真实终端一致（bash 刷新提示符）。
 // 无回显的设备将看不到输入 —— 与真实终端行为一致。
 function submitInput() {
-  if (!inputText || inputText.data === "") return;
+  if (!inputText) return;
   var line = inputText.data;
   inputText.data = "";
   api("/api/write", {method: "POST", body: JSON.stringify({data: line, eol: "cr"})})
-    .catch(function (e) { toast("发送失败: " + e.message); });
+    .catch(function (e) {
+      toast("发送失败: " + e.message);
+      inputText.data = line; // 失败恢复输入，便于重试
+    });
 }
 
 function sendHexStr(str) {
@@ -437,6 +1044,17 @@ consoleEl.addEventListener("keydown", function (e) {
   if (composing || e.key === "Process") return;
   var mod = e.ctrlKey || e.metaKey;
 
+  // —— 全屏程序模式：按键直接映射为终端序列发送 ——
+  if (vtMode) {
+    var seq = vtKeySeq(e);
+    if (seq !== null) {
+      e.preventDefault();
+      api("/api/write", {method: "POST", body: JSON.stringify({data: toHex(seq), hex: true})})
+        .catch(function (err) { toast("发送失败: " + err.message); });
+    }
+    return;
+  }
+
   if (e.key === "Enter") {
     e.preventDefault();
     submitInput();
@@ -527,10 +1145,17 @@ document.getElementById("hexBtn").onclick = function () {
   consoleEl.focus();
 };
 document.getElementById("clearBtn").onclick = function () {
-  // 清屏：移除 inputline 之外的全部节点
-  ensureInputline();
-  while (consoleEl.firstChild && consoleEl.firstChild !== inputlineSpan) {
-    consoleEl.removeChild(consoleEl.firstChild);
+  // 清屏：流式视图移除 inputline 之外节点；VT 模式下重置屏幕
+  if (vtMode) {
+    for (var y = 0; y < vtScreen.rows; y++) vtScreen.alt[y] = vtScreen.newLine();
+    vtScreen.lines = [vtScreen.newLine()];
+    vtScreen.cx = 0; vtScreen.cy = 0; vtScreen.acx = 0; vtScreen.acy = 0;
+    renderVT();
+  } else {
+    ensureInputline();
+    while (consoleEl.firstChild && consoleEl.firstChild !== inputlineSpan) {
+      consoleEl.removeChild(consoleEl.firstChild);
+    }
   }
   consoleLen = 0;
   ansiPending = "";
@@ -558,6 +1183,12 @@ refreshStatus();
 connectSSE();
 setInterval(refreshStatus, 3000);
 consoleEl.focus();
+// 顶栏按钮点击后把焦点还给终端（否则 Enter 会触发按钮而非发送）
+document.querySelector("header").addEventListener("click", function (e) {
+  if (e.target && e.target.tagName === "BUTTON") {
+    setTimeout(function () { consoleEl.focus(); }, 0);
+  }
+});
 </script>
 </body>
 </html>
