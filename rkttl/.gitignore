@@ -1,0 +1,8 @@
+# 构建产物
+bin/
+rkttl.exe
+rkttl-gui.exe
+
+# Go
+*.test
+*.out

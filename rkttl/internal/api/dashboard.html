@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rkttl 串口控制台</title>
+<style>
+:root { --bg:#1d1f21; --panel:#25282c; --fg:#c5c8c6; --dim:#8b8f94; --accent:#4d9f6d; --err:#e06c75; }
+* { box-sizing: border-box; }
+html,body { height:100%; margin:0; }
+body { background:var(--bg); color:var(--fg); font:13px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; display:flex; flex-direction:column; }
+header { background:var(--panel); padding:8px 12px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; border-bottom:1px solid #333; }
+header .logo { font-weight:700; color:#fff; margin-right:6px; }
+header .logo small { color:var(--dim); font-weight:400; }
+select,input[type=text],input[type=number] { background:#1a1c1e; color:var(--fg); border:1px solid #3a3e42; border-radius:4px; padding:4px 6px; font-size:13px; }
+button { background:#2f3439; color:var(--fg); border:1px solid #3a3e42; border-radius:4px; padding:4px 12px; cursor:pointer; font-size:13px; }
+button:hover { background:#3a4046; }
+button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+button.primary:hover { background:#5cb47d; }
+button:disabled { opacity:.5; cursor:default; }
+button.helpbtn { padding:2px 9px; font-weight:700; border-radius:50%; }
+.spacer { flex:1; }
+#statusbar { font-size:12px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+#console-wrap { flex:1; overflow:hidden; display:flex; padding:6px 0; }
+#console { flex:1; overflow:auto; padding:4px 10px; margin:0; outline:none; cursor:text;
+  font:12.5px/1.45 Consolas,"Cascadia Mono","Courier New",monospace; white-space:pre-wrap; word-break:break-all; }
+#console .sysline { color:var(--dim); }
+#console .b { font-weight:700; }
+#console:focus { background:#1a1c1f; }
+.fg30{color:#6a6a6a}.fg31{color:#e06c75}.fg32{color:#98c379}.fg33{color:#e5c07b}.fg34{color:#61afef}
+.fg35{color:#c678dd}.fg36{color:#56b6c2}.fg37{color:#abb2bf}
+.fg90{color:#5c6370}.fg91{color:#ff6b6b}.fg92{color:#9ec97f}.fg93{color:#f0d28c}
+.fg94{color:#77b5f5}.fg95{color:#d78ce0}.fg96{color:#6fd3d3}.fg97{color:#ffffff}
+/* 本地输入行 + 光标（xshell 式） */
+#inputline { color:#e8e8e8; }
+#console.focus #cursor { animation: blink 1.1s steps(1) infinite; }
+#cursor { color:#9ec97f; }
+@keyframes blink { 50% { opacity:0; } }
+footer { background:var(--panel); border-top:1px solid #333; padding:5px 12px; display:flex; flex-wrap:wrap; gap:10px; align-items:center;
+  font-size:12px; color:var(--dim); cursor:pointer; }
+footer kbd { background:#1a1c1e; border:1px solid #3a3e42; border-bottom-width:2px; border-radius:3px; padding:0 5px; font-size:11px; }
+#toast { position:fixed; left:50%; top:14px; transform:translateX(-50%); background:#333; color:#fff;
+  padding:6px 16px; border-radius:6px; opacity:0; transition:opacity .25s; pointer-events:none; z-index:9; }
+#toast.show { opacity:1; }
+/* 帮助浮层 */
+#helpmask { position:fixed; inset:0; background:rgba(0,0,0,.55); display:none; align-items:center; justify-content:center; z-index:10; }
+#helpmask.show { display:flex; }
+#helpbox { background:var(--panel); border:1px solid #3a3e42; border-radius:8px; max-width:640px; width:92%;
+  padding:16px 20px; font-size:13px; }
+#helpbox h3 { margin:0 0 8px; color:#fff; }
+#helpbox pre { background:#1a1c1e; border:1px solid #3a3e42; border-radius:6px; padding:10px 12px;
+  overflow:auto; font:12px/1.6 Consolas,monospace; }
+#helpbox .cmd { color:#9ec97f; }
+#helpbox ol { margin:6px 0; padding-left:20px; }
+#helpbox li { margin:3px 0; }
+#helpbox .close { float:right; }
+</style>
+</head>
+<body>
+<header>
+  <span class="logo">rkttl <small>串口共享终端</small></span>
+  <select id="portSel" title="串口"></select>
+  <button id="refreshBtn" title="刷新串口列表">刷新</button>
+  <input type="number" id="baud" value="1500000" title="波特率" style="width:110px">
+  <button id="openBtn" class="primary">打开串口</button>
+  <button id="closeBtn">关闭</button>
+  <button id="flushBtn" title="清空接收缓冲与会话日志文件">清空日志</button>
+  <button id="exportBtn" title="下载完整会话日志（原始字节流，含 ANSI 颜色）">导出日志</button>
+  <button id="hexBtn" title="输入十六进制字节串发送（如 0d0a41）">HEX</button>
+  <button id="ctrlc" title="发送 0x03 中断信号">Ctrl+C</button>
+  <button id="clearBtn" title="仅清空屏幕显示（保留日志与缓冲）">清屏</button>
+  <button id="helpBtn" class="helpbtn" title="Linux/远端如何连接（nc / socat / TCP 桥）">?</button>
+  <label class="inline" title="新输出到达时自动滚动到底部"><input type="checkbox" id="autoscroll" checked>自动滚动</label>
+  <span class="spacer"></span>
+  <span id="statusbar">连接中…</span>
+</header>
+<div id="console-wrap"><div id="console" tabindex="0" spellcheck="false"></div></div>
+<footer id="hintbar" title="点击聚焦终端">
+  终端已直连串口 —— 直接输入命令，<kbd>Enter</kbd> 发送 ·
+  <kbd>Ctrl+C</kbd> 中断 · <kbd>Tab</kbd>/<kbd>Esc</kbd>/<kbd>Ctrl+D</kbd>/<kbd>Ctrl+U</kbd> 透传 ·
+  粘贴将逐行执行 · 点击右上 <b>?</b> 查看远端接入方式
+</footer>
+<div id="toast"></div>
+<div id="helpmask">
+  <div id="helpbox">
+    <button class="close" onclick="document.getElementById('helpmask').classList.remove('show')">关闭</button>
+    <h3>远端接入方式</h3>
+    <p>当前控制台：<span class="cmd" id="helpHttp"></span></p>
+    <p><b>Linux / macOS</b> 通过 TCP 桥连接（端口以 rkttl 主机端"TCP 桥"设置为准，默认 9999）：</p>
+    <pre>
+# 1) nc 交互（最简单）
+<span class="cmd">nc <span id="helpIp1"></span> 9999</span>
+
+# 2) socat 终端模式（回显更接近真实终端）
+<span class="cmd">socat -,raw,echo=0 TCP:<span id="helpIp2"></span>:9999</span>
+
+# 3) 伪装成本地串口设备（供只认 /dev/tty* 的工具使用）
+<span class="cmd">socat pty,link=/tmp/ttyrkttl,raw TCP:<span id="helpIp3"></span>:9999</span>
+screen /tmp/ttyrkttl 1500000</pre>
+    <ol>
+      <li>TCP 桥支持<b>多客户端同时收发</b>，与网页控制台共享同一路串口（tmux 式）。</li>
+      <li>连接后会先收到一行 rkttl 状态横幅，之后为纯透传。</li>
+      <li>Windows 主机首次开桥时请允许防火墙放行该端口。</li>
+      <li>程序化访问建议用 HTTP API（curl）而非 TCP：见项目 README 的 /api/read、/api/write。</li>
+    </ol>
+  </div>
+</div>
+<script>
+"use strict";
+var TOKEN = new URLSearchParams(location.search).get("token") || "";
+var dec = new TextDecoder("utf-8", { fatal: false });
+var lastSeq = null;
+var es = null;
+var consoleEl = document.getElementById("console");
+
+function toast(msg) {
+  var t = document.getElementById("toast");
+  t.textContent = msg; t.classList.add("show");
+  setTimeout(function () { t.classList.remove("show"); }, 2500);
+}
+
+function apiURL(path) {
+  var u = new URL(path, location.origin);
+  if (TOKEN) u.searchParams.set("token", TOKEN);
+  return u.toString();
+}
+
+function api(path, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({"Content-Type": "application/json"}, opts.headers || {});
+  return fetch(apiURL(path), opts).then(function (res) {
+    return res.json().catch(function () { return {ok: false, error: "HTTP " + res.status}; }).then(function (j) {
+      if (!res.ok || j.ok === false) throw new Error(j.error || ("HTTP " + res.status));
+      return j.data;
+    });
+  });
+}
+
+// ---------- 控制台渲染（流式，DOM 即状态） ----------
+// 关键设计：换行/退格/颜色全部落在持续存在的 DOM 文本节点上，
+// 与 SSE 数据块边界完全无关；本地输入行（inputline）始终是最后一个
+// 子节点，串口输出插入到它之前 —— 与 xshell 的行为一致。
+var curFg = null, curBold = false;
+var ansiPending = "";               // 被切在块边界上的不完整 ANSI 序列
+var curSpan = null, curText = null; // 当前样式段的 span 与其文本节点
+var consoleLen = 0;
+var CONSOLE_CAP = 1024 * 1024;
+
+var FG = {30:"#6a6a6a",31:"#e06c75",32:"#98c379",33:"#e5c07b",34:"#61afef",35:"#c678dd",36:"#56b6c2",37:"#abb2bf",
+          90:"#5c6370",91:"#ff6b6b",92:"#9ec97f",93:"#f0d28c",94:"#77b5f5",95:"#d78ce0",96:"#6fd3d3",97:"#ffffff"};
+
+// inputline：本地输入行（span#inputline 内含文本节点与光标）
+var inputlineSpan = null, inputText = null;
+
+function ensureInputline() {
+  if (inputlineSpan && inputlineSpan.parentNode === consoleEl) return;
+  inputlineSpan = document.createElement("span");
+  inputlineSpan.id = "inputline";
+  inputText = document.createTextNode("");
+  inputlineSpan.appendChild(inputText);
+  var cur = document.createElement("span");
+  cur.id = "cursor";
+  cur.textContent = "\u258c"; // ▌
+  inputlineSpan.appendChild(cur);
+  consoleEl.appendChild(inputlineSpan);
+}
+
+// addNode 把节点插到 inputline 之前（inputline 永远最后）
+function addNode(node) {
+  ensureInputline();
+  consoleEl.insertBefore(node, inputlineSpan);
+}
+
+function applySGR(params) {
+  for (var i = 0; i < params.length; i++) {
+    var p = parseInt(params[i] || "0", 10);
+    if (p === 0) { curFg = null; curBold = false; }
+    else if (p === 1) curBold = true;
+    else if (p === 22) curBold = false;
+    else if (p === 39) curFg = null;
+    else if (FG[p]) curFg = FG[p];
+    else if (p === 38 && params[i+1] === "5") i += 2; // 256 色：跳过
+    else if (p === 48 && params[i+1] === "5") i += 2;
+  }
+}
+
+// putText 把串口文本追加到"当前样式段"；样式变化时开新段
+function putText(s) {
+  if (!s) return;
+  if (!curSpan || curSpan._fg !== curFg || curSpan._bold !== curBold) {
+    var span = document.createElement("span");
+    if (curBold) span.className = "b";
+    if (curFg) span.style.color = curFg;
+    span._fg = curFg;
+    span._bold = curBold;
+    curText = document.createTextNode("");
+    span.appendChild(curText);
+    addNode(span);
+    curSpan = span;
+  }
+  curText.data += s;
+  consoleLen += s.length;
+}
+
+// backspace 删除串口输出流的最后一个字符（跳过本地输入行）；
+// 行首（前一字符是 \n）为 no-op
+function backspace() {
+  var t = curText;
+  if (t && t.data.length) {
+    if (t.data.slice(-1) === "\n") return;
+    t.data = t.data.slice(0, -1);
+    return;
+  }
+  ensureInputline();
+  var el = curSpan ? curSpan.previousSibling : inputlineSpan.previousSibling;
+  while (el) {
+    if (el._sys) return; // 不删系统提示行
+    var tn = lastTextOf(el);
+    if (tn && tn.data.length) {
+      if (tn.data.slice(-1) === "\n") return;
+      tn.data = tn.data.slice(0, -1);
+      return;
+    }
+    el = el.previousSibling;
+  }
+}
+function lastTextOf(el) {
+  if (el.nodeType === 3) return el;
+  for (var i = el.childNodes.length - 1; i >= 0; i--) {
+    var t = lastTextOf(el.childNodes[i]);
+    if (t && t.data.length) return t;
+  }
+  return null;
+}
+
+function maybeTrim() {
+  if (consoleLen <= CONSOLE_CAP && consoleEl.childNodes.length <= 4000) return;
+  ensureInputline();
+  while (consoleEl.firstChild && consoleEl.firstChild !== inputlineSpan &&
+         (consoleLen > CONSOLE_CAP / 2 || consoleEl.childNodes.length > 3000)) {
+    var f = consoleEl.firstChild;
+    consoleLen -= (f.textContent || "").length;
+    consoleEl.removeChild(f);
+  }
+  curSpan = curText = null; // 引用的节点可能已被移除
+}
+
+function autoScroll() {
+  if (document.getElementById("autoscroll").checked) {
+    consoleEl.scrollTop = consoleEl.scrollHeight;
+  }
+}
+
+// renderChunk 渲染一个串口数据块；不完整的多字节 UTF-8 由 TextDecoder
+// 流式缓冲，不完整的 ANSI 序列由 ansiPending 缓冲到下一块
+function renderChunk(bytes) {
+  var s = ansiPending + dec.decode(bytes, { stream: true });
+  ansiPending = "";
+  var i = 0;
+  while (i < s.length) {
+    var c = s.charCodeAt(i);
+    if (c === 27) { // ESC
+      if (i + 1 >= s.length) { ansiPending = s.slice(i); break; }
+      if (s[i+1] === "[") { // CSI
+        var j = i + 2;
+        while (j < s.length) { var fc = s.charCodeAt(j); if (fc >= 0x40 && fc <= 0x7e) break; j++; }
+        if (j >= s.length) { ansiPending = s.slice(i); break; }
+        if (s[j] === "m") { applySGR(s.slice(i + 2, j).split(";")); curSpan = null; }
+        i = j + 1;
+      } else if (s[i+1] === "]") { // OSC
+        var k = i + 2, end = -1;
+        while (k < s.length) {
+          if (s[k] === "\x07") { end = k; break; }
+          if (s.charCodeAt(k) === 27 && k + 1 < s.length && s[k+1] === "\\") { end = k; break; }
+          k++;
+        }
+        if (end < 0) { ansiPending = s.slice(i); break; }
+        i = (s.charCodeAt(end) === 27) ? end + 2 : end + 1;
+      } else { i += 2; }
+    } else if (c === 10) { putText("\n"); i++; }
+    else if (c === 13) { i++; }                          // \r 丢弃
+    else if (c === 8)  { backspace(); i++; }             // \b 退格（可跨块）
+    else if (c < 32)   { i++; }                          // 其他控制字符
+    else { putText(s[i]); i++; }
+  }
+  maybeTrim();
+}
+
+function appendData(b64) {
+  var bin = atob(b64);
+  var bytes = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  renderChunk(bytes);
+  autoScroll();
+}
+
+function sysLine(text) {
+  var div = document.createElement("div");
+  div.className = "sysline";
+  div._sys = true;
+  div.textContent = "── " + text + " ──";
+  addNode(div);
+  curSpan = curText = null;
+  autoScroll();
+}
+
+// handleDataEvent 处理一条串口数据事件（含历史回放块）。
+// 以 seq 单调性去重：历史回放、SSE 断线自动重连造成的重复/乱序
+// 事件都会被跳过，保证内容不重不漏。
+function handleDataEvent(j) {
+  if (lastSeq !== null && j.seq <= lastSeq) return;
+  lastSeq = j.seq;
+  appendData(j.b64);
+}
+
+// ---------- 本地输入行（xshell 式直连输入） ----------
+
+function inputLen() { return inputText ? inputText.data.length : 0; }
+
+function inputPut(s) {
+  ensureInputline();
+  inputText.data += s;
+}
+
+function inputBackspace() {
+  if (inputText && inputText.data.length) {
+    inputText.data = Array.from(inputText.data).slice(0, -1).join("");
+  }
+}
+
+// submitInput 发送本地输入行并清空之（显示交给设备回显）。
+// 无回显的设备将看不到输入 —— 与真实终端行为一致。
+function submitInput() {
+  if (!inputText || inputText.data === "") return;
+  var line = inputText.data;
+  inputText.data = "";
+  api("/api/write", {method: "POST", body: JSON.stringify({data: line, eol: "cr"})})
+    .catch(function (e) { toast("发送失败: " + e.message); });
+}
+
+function sendHexStr(str) {
+  api("/api/write", {method: "POST", body: JSON.stringify({data: str, hex: true})})
+    .then(function () { toast("HEX 已发送"); })
+    .catch(function (e) { toast("HEX 发送失败: " + e.message); });
+}
+
+function pasteLines(text) {
+  var lines = text.split(/\r?\n/).filter(function (l) { return l.length; });
+  if (!lines.length) return;
+  var body = lines.map(function (l) { return {data: l, eol: "cr"}; });
+  (function next(i) {
+    if (i >= body.length) { toast("已粘贴 " + body.length + " 行"); return; }
+    api("/api/write", {method: "POST", body: JSON.stringify(body[i])})
+      .then(function () { next(i + 1); })
+      .catch(function (e) { toast("粘贴中断: " + e.message); });
+  })(0);
+}
+
+// ---------- SSE 实时流（连接即回放接收缓冲中的历史日志） ----------
+function connectSSE() {
+  es = new EventSource(apiURL("/api/stream"));
+  es.addEventListener("data", function (e) {
+    handleDataEvent(JSON.parse(e.data));
+  });
+  es.addEventListener("status", function (e) {
+    var j = JSON.parse(e.data);
+    if (j.type === "hello") { sysLine("已连接到 rkttl 服务（实时流，历史日志已推送）"); }
+    else sysLine(j.type === "opened" ? ("串口已打开: " + j.info) : ("串口已关闭: " + (j.info || "")));
+    refreshStatus();
+  });
+  es.onerror = function () { /* EventSource 自动重连，重连后按 seq 去重补齐 */ };
+}
+
+// ---------- 控制操作 ----------
+function refreshPorts() {
+  return api("/api/ports").then(function (d) {
+    var sel = document.getElementById("portSel");
+    var prev = sel.value;
+    sel.innerHTML = "";
+    (d.ports || []).forEach(function (p) {
+      var o = document.createElement("option");
+      o.value = p.name;
+      o.textContent = p.name + (p.product ? " · " + p.product : "");
+      sel.appendChild(o);
+    });
+    if (prev && Array.prototype.some.call(sel.options, function (o) { return o.value === prev; })) sel.value = prev;
+    if (!d.ports || !d.ports.length) sysLine("未发现本机串口（Windows 需先安装 CH340 等驱动）");
+  }).catch(function (e) { toast("获取串口列表失败: " + e.message); });
+}
+
+function openPort() {
+  var port = document.getElementById("portSel").value;
+  var baud = parseInt(document.getElementById("baud").value, 10) || 1500000;
+  if (!port) { toast("请先选择串口"); return; }
+  api("/api/open", {method: "POST", body: JSON.stringify({port: port, baud: baud})})
+    .then(function () { toast("已打开 " + port + " @ " + baud); consoleEl.focus(); })
+    .catch(function (e) { toast("打开失败: " + e.message); });
+}
+function closePort() {
+  api("/api/close", {method: "POST"}).then(function () { toast("已关闭串口"); })
+    .catch(function (e) { toast("关闭失败: " + e.message); });
+}
+
+function refreshStatus() {
+  api("/api/status").then(function (d) {
+    var s = d.serial, txt;
+    if (s.open) txt = s.port + " @" + s.baud + " 已连接 · ";
+    else txt = "串口未打开 · ";
+    txt += "RX " + human(s.received) + " TX " + human(s.sent) + " · 共享端 " + s.subscribers;
+    document.getElementById("statusbar").textContent = txt;
+    var openBtn = document.getElementById("openBtn");
+    openBtn.disabled = s.open; openBtn.textContent = s.open ? "已打开" : "打开串口";
+    if (s.default_baud && !document.getElementById("baud").value) document.getElementById("baud").value = s.default_baud;
+  }).catch(function (e) {
+    document.getElementById("statusbar").textContent = "状态获取失败: " + e.message;
+  });
+}
+
+function human(n) {
+  if (n < 1024) return n + "B";
+  if (n < 1048576) return (n / 1024).toFixed(1) + "KB";
+  return (n / 1048576).toFixed(2) + "MB";
+}
+
+// ---------- 键盘（终端直连输入） ----------
+var composing = false;
+
+consoleEl.addEventListener("compositionstart", function () { composing = true; });
+consoleEl.addEventListener("compositionend", function (e) {
+  composing = false;
+  if (e.data) inputPut(e.data);
+  autoScroll();
+});
+
+consoleEl.addEventListener("keydown", function (e) {
+  // IME 组合期间不处理
+  if (composing || e.key === "Process") return;
+  var mod = e.ctrlKey || e.metaKey;
+
+  if (e.key === "Enter") {
+    e.preventDefault();
+    submitInput();
+    autoScroll();
+    return;
+  }
+  if (e.key === "Backspace") {
+    e.preventDefault();
+    inputBackspace();
+    return;
+  }
+  if (e.key === "Tab") {
+    e.preventDefault();
+    api("/api/write", {method: "POST", body: JSON.stringify({data: "09", hex: true})});
+    return;
+  }
+  if (e.key === "Escape") {
+    e.preventDefault();
+    api("/api/write", {method: "POST", body: JSON.stringify({data: "1b", hex: true})});
+    return;
+  }
+  if (mod && !e.altKey) {
+    switch (e.key.toLowerCase()) {
+      case "c":
+        // 有选区时保留原生复制行为，无选区发送 0x03 中断
+        var sel = window.getSelection();
+        if (sel && sel.toString()) return;
+        e.preventDefault();
+        api("/api/write", {method: "POST", body: JSON.stringify({data: "03", hex: true})});
+        return;
+      case "d":
+        e.preventDefault();
+        api("/api/write", {method: "POST", body: JSON.stringify({data: "04", hex: true})});
+        return;
+      case "u":
+        e.preventDefault();
+        api("/api/write", {method: "POST", body: JSON.stringify({data: "15", hex: true})});
+        return;
+      case "v":
+        // 非安全上下文（http）无法用 clipboard API，降级为提示
+        e.preventDefault();
+        if (navigator.clipboard && navigator.clipboard.readText) {
+          navigator.clipboard.readText().then(pasteLines).catch(function () {
+            toast("浏览器禁止网页读取剪贴板，请用下方提示行旁的输入方式或 nc 接入");
+          });
+        } else {
+          toast("当前环境不支持网页粘贴，请用 nc/socat 接入后粘贴");
+        }
+        return;
+    }
+    return;
+  }
+  if (e.key.length === 1 && !e.altKey) {
+    // 可打印字符进入本地输入行（含中文 IME 递交的单字）
+    e.preventDefault();
+    inputPut(e.key);
+    autoScroll();
+  }
+  // 其余按键（方向键/PageUp/Home 等）交给浏览器默认滚动行为
+});
+
+// 点击终端区域确保聚焦（xshell 式体验）
+consoleEl.addEventListener("mousedown", function () { consoleEl.focus(); });
+document.getElementById("hintbar").addEventListener("click", function () { consoleEl.focus(); });
+consoleEl.addEventListener("focus", function () { consoleEl.classList.add("focus"); });
+consoleEl.addEventListener("blur", function () { consoleEl.classList.remove("focus"); });
+
+// ---------- 事件绑定 ----------
+document.getElementById("refreshBtn").onclick = refreshPorts;
+document.getElementById("openBtn").onclick = openPort;
+document.getElementById("closeBtn").onclick = closePort;
+document.getElementById("flushBtn").onclick = function () {
+  api("/api/flush", {method: "POST", body: JSON.stringify({file: true})}).then(function (d) {
+    sysLine(d.file_truncated ? "接收缓冲与日志文件已清空" : "接收缓冲已清空" + (d.file_error ? "（日志文件: " + d.file_error + "）" : ""));
+    consoleEl.focus();
+  }).catch(function (e) { toast("清空失败: " + e.message); });
+};
+document.getElementById("exportBtn").onclick = function () {
+  location.href = apiURL("/api/export");
+};
+document.getElementById("ctrlc").onclick = function () {
+  api("/api/write", {method: "POST", body: JSON.stringify({data: "03", hex: true})});
+  consoleEl.focus();
+};
+document.getElementById("hexBtn").onclick = function () {
+  var s = prompt("输入十六进制字节（可含空格/冒号，如 0d0a41）：");
+  if (s) sendHexStr(s);
+  consoleEl.focus();
+};
+document.getElementById("clearBtn").onclick = function () {
+  // 清屏：移除 inputline 之外的全部节点
+  ensureInputline();
+  while (consoleEl.firstChild && consoleEl.firstChild !== inputlineSpan) {
+    consoleEl.removeChild(consoleEl.firstChild);
+  }
+  consoleLen = 0;
+  ansiPending = "";
+  curSpan = curText = null;
+  dec = new TextDecoder("utf-8", { fatal: false });
+  consoleEl.focus();
+};
+document.getElementById("helpBtn").onclick = function () {
+  var ip = location.hostname || "<rkttl主机IP>";
+  document.getElementById("helpHttp").textContent = location.origin + (TOKEN ? "/?token=" + TOKEN : "");
+  ["helpIp1", "helpIp2", "helpIp3"].forEach(function (id) {
+    document.getElementById(id).textContent = ip;
+  });
+  document.getElementById("helpmask").classList.add("show");
+};
+document.getElementById("helpmask").addEventListener("click", function (e) {
+  if (e.target === this) this.classList.remove("show");
+  consoleEl.focus();
+});
+
+// ---------- 初始化 ----------
+ensureInputline();
+refreshPorts();
+refreshStatus();
+connectSSE();
+setInterval(refreshStatus, 3000);
+consoleEl.focus();
+</script>
+</body>
+</html>
