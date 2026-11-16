@@ -46,12 +46,12 @@ const (
 
 // Event 是推送给订阅者的事件。
 type Event struct {
-	Type string // "data" | "opened" | "closed"
-	Data []byte // 仅 data 事件携带串口原始数据
-	Seq  uint64 // data 事件：该批数据末端的 seq
-	Info string // opened/closed 事件的状态说明（如错误原因）
+	Type  string // "data" | "opened" | "closed"
+	Data  []byte // 仅 data 事件携带串口原始数据
+	Seq   uint64 // data 事件：该批数据末端的 seq
+	Info  string // opened/closed 事件的状态说明（如错误原因）
 	Epoch uint64 // 事件所属连接生命周期
-	At   time.Time
+	At    time.Time
 }
 
 // SerialConfig 描述一次串口打开参数。
@@ -115,6 +115,7 @@ type SerialHub struct {
 	lastErr  string
 	openedAt time.Time
 
+	openMu  sync.Mutex // 串行化 Open/Close/reopenLoop，防止并发打开同一串口
 	writeMu sync.Mutex // 串行化并发写，避免字节交错
 
 	ring *RingBuffer
@@ -188,6 +189,7 @@ func (h *SerialHub) Default() SerialConfig {
 }
 
 // Open 打开串口；若已有连接则先关闭再按新配置打开（换口/改波特率）。
+// openMu 保证串行化：reopenLoop 与手动 Open 不会并发执行 serial.Open。
 func (h *SerialHub) Open(cfg SerialConfig) error {
 	cfg.Port = normalizePortName(cfg.Port)
 	cfg = cfg.withDefaults()
@@ -198,6 +200,9 @@ func (h *SerialHub) Open(cfg SerialConfig) error {
 		h.mu.Unlock()
 		return err
 	}
+
+	h.openMu.Lock()
+	defer h.openMu.Unlock()
 
 	h.mu.Lock()
 	if h.stopped {
@@ -250,7 +255,11 @@ func (h *SerialHub) Open(cfg SerialConfig) error {
 }
 
 // Close 手动关闭串口（不触发自动重连；会话日志文件随之结束）。
+// openMu 保证与 Open/reopenLoop 串行化，防止并发关闭与打开竞争。
 func (h *SerialHub) Close() error {
+	h.openMu.Lock()
+	defer h.openMu.Unlock()
+
 	h.cancelReopen()
 	if !h.stopPort(true) {
 		return nil
@@ -264,6 +273,9 @@ func (h *SerialHub) Close() error {
 
 // Stop 停止 hub：关闭串口并抑制自动重连。用于进程退出。
 func (h *SerialHub) Stop() {
+	h.openMu.Lock()
+	defer h.openMu.Unlock()
+
 	h.cancelReopen()
 	h.mu.Lock()
 	h.stopped = true

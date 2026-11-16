@@ -229,10 +229,20 @@ function handleJSON(text) {
   try { msg = JSON.parse(text); } catch (e) { return; }
   switch (msg.type) {
     case 'status':
-      if (typeof msg.seq === 'number' && msg.seq > lastSeq) { lastSeq = msg.seq; }
+      if (msg.event === 'opened') {
+        // 串口重新打开：seq 归零（hub 重置环形缓冲），客户端也要重置
+        // 否则 reset 后新数据（seq 小于旧 lastSeq）会被全部忽略
+        lastSeq = 0;
+        term.writeln('\r\n\x1b[32m[串口已打开] ' + (msg.info || '') + '\x1b[0m');
+      } else if (typeof msg.seq === 'number' && msg.seq > lastSeq) {
+        lastSeq = msg.seq;
+      }
       renderStatus(msg, false);
-      if (msg.event === 'opened') { term.writeln('\r\n\x1b[32m[串口已打开] ' + (msg.info || '') + '\x1b[0m'); }
-      if (msg.event === 'closed') { term.writeln('\r\n\x1b[31m[串口已断开] ' + (msg.info || '') + '\x1b[0m'); }
+      if (msg.event === 'closed') {
+        // 串口断开：重置 lastSeq，避免重连时用旧 seq 请求已被清空的历史
+        lastSeq = 0;
+        term.writeln('\r\n\x1b[31m[串口已断开] ' + (msg.info || '') + '\x1b[0m');
+      }
       updateSeqLabel();
       break;
     case 'meta':

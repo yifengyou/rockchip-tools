@@ -76,6 +76,7 @@ type app struct {
 	inputAnchor16  int    // 本地输入行起点的 UTF-16 索引（其前为串口输出/提示符）
 	pendingLine    string // 已提交待清理的本地行内容
 	pendingClean16 int    // 待清理的 UTF-16 单元数（行 + EDIT 插入的 \r\n）
+	deferredClear  bool   // reset/clear 后延迟清屏（避免 EN_CHANGE 重入）
 	oplog          *oplog.Logger
 	logInitErr     string // 文件日志初始化错误（窗口创建后提示）
 
@@ -467,7 +468,10 @@ func (a *app) flushPending(pending *[]byte) {
 		}
 		if clearReq {
 			// clear/reset 命令：清空流式终端（保留 EDIT，重置锚点）
-			a.logView.SetText("")
+			// 关键：SetText("") 会触发 EN_CHANGE，若在 EN_CHANGE 处理栈内
+			// 再次 SetText 会导致 Win32 EDIT 内部状态损坏（卡死/闪退）。
+			// 因此用 defer 延迟到当前消息循环结束后再执行。
+			a.deferredClear = true
 			a.logLen = 0
 			a.inputAnchor16 = 0
 			a.pendingClean16 = 0
@@ -478,6 +482,19 @@ func (a *app) flushPending(pending *[]byte) {
 			text = ansi.Strip(text)
 		}
 		a.termWrite(normalizeEOL(text), false)
+		// 延迟清屏：在当前消息循环结束后执行，避免 EN_CHANGE 重入
+		if a.deferredClear {
+			a.deferredClear = false
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				if a.uiAlive.Load() {
+					a.mw.Synchronize(func() {
+						a.logView.SetText("")
+						a.inputAnchor16 = 0
+					})
+				}
+			}()
+		}
 	})
 }
 

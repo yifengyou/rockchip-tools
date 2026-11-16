@@ -423,6 +423,15 @@ func (s *Server) forward(c *wsClient, sub chan hub.Event) {
 				return
 			}
 			switch ev.Type {
+			case "opened":
+				// 串口重新打开：seq 从 0 重新计（hub.Open 会 ring.Reset()），
+				// 必须重置 lastSeq，否则新连接的早期数据（seq < 旧 lastSeq）
+				// 会被全部丢弃 —— 这正是 reset 后 Web 端看不到输出的根因。
+				lastSeq = 0
+				c.lastSeq = 0
+				c.pushStatusWithInfo(ev.Type, ev.Info)
+			case "closed":
+				c.pushStatusWithInfo(ev.Type, ev.Info)
 			case "data":
 				// 若事件 seq 与期望不符（订阅队列曾溢出），先补缓冲
 				if ev.Seq > lastSeq+uint64(len(ev.Data)) {
@@ -437,8 +446,6 @@ func (s *Server) forward(c *wsClient, sub chan hub.Event) {
 				c.enqueueData(ev.Data)
 				lastSeq = ev.Seq
 				c.lastSeq = lastSeq
-			case "opened", "closed":
-				c.pushStatusWithInfo(ev.Type, ev.Info)
 			}
 		}
 	}
@@ -452,7 +459,9 @@ func (c *wsClient) enqueueData(b []byte) {
 	copy(cp, b)
 	select {
 	case c.send <- wsFrame{kind: websocket.BinaryMessage, data: cp}:
+		c.srv.logf("enqueueData: 已投递 %d 字节到 send 通道", len(b))
 	case <-c.closed:
+		c.srv.logf("enqueueData: 连接已关闭，丢弃 %d 字节", len(b))
 	default:
 		// 待发队列满：丢弃并标记，让客户端通过 seq 补齐。
 		// 这里不阻塞串口读循环。
@@ -476,16 +485,16 @@ func (c *wsClient) pushStatus() {
 	st := c.hub.Status()
 	c.lastSeq = st.Seq
 	c.enqueueJSON(map[string]any{
-		"type":         "status",
-		"open":         st.Open,
-		"port":         st.Port,
-		"baud":         st.Baud,
-		"seq":          st.Seq,
-		"rx":           st.Received,
-		"tx":           st.Sent,
-		"subscribers":  st.Subscribers,
-		"auto_reopen":  st.AutoReopen,
-		"last_error":   st.LastError,
+		"type":        "status",
+		"open":        st.Open,
+		"port":        st.Port,
+		"baud":        st.Baud,
+		"seq":         st.Seq,
+		"rx":          st.Received,
+		"tx":          st.Sent,
+		"subscribers": st.Subscribers,
+		"auto_reopen": st.AutoReopen,
+		"last_error":  st.LastError,
 	})
 }
 

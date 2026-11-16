@@ -358,3 +358,124 @@ func TestWebSocketMultiClient(t *testing.T) {
 		t.Error("客户端 B 未收到共享输出")
 	}
 }
+
+// TestWebSocketResetRecovery 模拟设备 reset 场景：
+// 1. 串口断开（设备重启），广播 closed
+// 2. hub 重新打开（autoReopen），ring.Reset()，seq 从 0 重新计
+// 3. 新数据（seq=1..N）必须能到达客户端（不能被 lastSeq 丢弃）
+func TestWebSocketResetRecovery(t *testing.T) {
+	master, portName, cleanup := ptyPair(t)
+	defer cleanup()
+
+	h := hub.New(1<<20, false, nil, false)
+	cfg := hub.DefaultConfig(portName)
+	h.SetDefault(cfg)
+	if err := h.Open(cfg); err != nil {
+		t.Fatalf("打开串口: %v", err)
+	}
+	defer h.Stop()
+
+	srv := ws.New(h, "", cfg, nil)
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("WebSocket dial: %v", err)
+	}
+	defer conn.Close()
+	// 读侧不设 deadline：用 stop channel 控制生命周期，避免读超时误判
+	_ = conn.SetReadDeadline(time.Time{})
+
+	// 后台持续向 PTY 写入（模拟设备持续输出），直到 stopWrite 关闭
+	stopWrite := make(chan struct{})
+	writeDone := make(chan struct{})
+	go func() {
+		defer close(writeDone)
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopWrite:
+				return
+			case <-ticker.C:
+				if _, err := master.Write([]byte("tick-reset-payload\r\n")); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	defer func() {
+		close(stopWrite)
+		<-writeDone
+	}()
+
+	// readEvent 等待指定类型或数据片段出现；返回收到的全部二进制与文本帧
+	readEvent := func(wantType string, wantData string, maxFrames int) (bin []byte, texts []string) {
+		for i := 0; i < maxFrames; i++ {
+			mt, data, err := conn.ReadMessage()
+			if err != nil {
+				return bin, texts
+			}
+			if mt == websocket.BinaryMessage {
+				bin = append(bin, data...)
+				if wantData != "" && strings.Contains(string(bin), wantData) {
+					return bin, texts
+				}
+			} else {
+				texts = append(texts, string(data))
+				if wantType != "" && strings.Contains(string(data), wantType) {
+					return bin, texts
+				}
+			}
+		}
+		return bin, texts
+	}
+
+	// 阶段 1：等待任意二进制数据到达（证明 hub -> forward -> writePump -> 客户端 链路通）
+	binBefore, textsBefore := readEvent("", "tick-reset-payload", 200)
+	if len(binBefore) == 0 {
+		t.Fatalf("阶段1: 未收到任何二进制帧（texts=%v, hub=%+v）", textsBefore, h.Status())
+	}
+	t.Logf("阶段1: 收到 %d 字节二进制数据", len(binBefore))
+
+	// 阶段 2：模拟 reset —— 断开串口，等待 closed 状态帧
+	if err := h.Close(); err != nil {
+		t.Fatalf("关闭串口: %v", err)
+	}
+	_, textsClosed := readEvent("closed", "", 50)
+	foundClosed := false
+	for _, tx := range textsClosed {
+		if strings.Contains(tx, `"event":"closed"`) {
+			foundClosed = true
+			break
+		}
+	}
+	if !foundClosed {
+		t.Fatalf("阶段2: 未收到 closed 事件（texts=%v）", textsClosed)
+	}
+
+	// 阶段 3：重新打开串口（ring.Reset，seq 归零）
+	if err := h.Open(cfg); err != nil {
+		t.Fatalf("重开串口: %v", err)
+	}
+	_, textsOpened := readEvent("opened", "", 50)
+	foundOpened := false
+	for _, tx := range textsOpened {
+		if strings.Contains(tx, `"event":"opened"`) {
+			foundOpened = true
+			break
+		}
+	}
+	if !foundOpened {
+		t.Fatalf("阶段3: 未收到 opened 事件（texts=%v）", textsOpened)
+	}
+
+	// 阶段 4：重开后等待新数据到达（seq 已归零，若 lastSeq 未重置则永远收不到）
+	binAfter, _ := readEvent("", "tick-reset-payload", 200)
+	if len(binAfter) == 0 {
+		t.Fatalf("阶段4: 重开后未收到二进制帧（lastSeq 未重置？hub=%+v）", h.Status())
+	}
+	t.Logf("阶段4: 重开后收到 %d 字节二进制数据", len(binAfter))
+}
