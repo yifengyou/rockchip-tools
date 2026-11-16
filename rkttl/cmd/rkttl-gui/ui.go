@@ -20,7 +20,7 @@ import (
 	"github.com/lxn/win"
 
 	"rkttl/internal/ansi"
-	"rkttl/internal/api"
+	"rkttl/internal/ws"
 	"rkttl/internal/hub"
 	"rkttl/internal/oplog"
 	"rkttl/internal/tcpbridge"
@@ -34,7 +34,7 @@ type app struct {
 	mw *walk.MainWindow
 
 	hub    *hub.SerialHub
-	apiSrv *api.Server
+	apiSrv *ws.Server
 	bridge *tcpbridge.Bridge
 
 	apiRunning bool
@@ -60,7 +60,7 @@ type app struct {
 	tcpAddr   *walk.LineEdit
 	tcpState  *walk.Label
 	nicCombo  *walk.ComboBox
-	nicIfs    []api.NetIf // nicCombo 的模型（下标 0 为"全部网卡"）
+	nicIfs    []ws.NetIf // nicCombo 的模型（下标 0 为"全部网卡"）
 	tokenEdit *walk.LineEdit
 	urlHint   *walk.Label
 	logHint   *walk.Label
@@ -93,7 +93,7 @@ type app struct {
 	snapAnchor16 int       // 进入快照时的输入锚点
 
 	logLen      int // 终端区近似字节数（用于滚动上限裁剪）
-	portDetails []api.PortInfo
+	portDetails []ws.PortInfo
 	doneCh      chan struct{}
 	uiAlive     atomic.Bool // 消息循环存活标记
 }
@@ -107,7 +107,7 @@ func newApp() (*app, error) {
 	a.hub = hub.New(1<<20, true, nil, false) // 1MB 缓冲；断线自动重连默认开启
 	cfg := hub.DefaultConfig("")
 	a.hub.SetDefault(cfg)
-	a.apiSrv = api.New(a.hub, genToken(), cfg, nil)
+	a.apiSrv = ws.New(a.hub, genToken(), cfg, nil)
 	// 一旦打开串口即把原始字节流记录到 exe 同目录 logs/ 下
 	if dir, err := logDirDefault(); err != nil {
 		a.logInitErr = "确定日志目录失败: " + err.Error()
@@ -986,7 +986,7 @@ func portOf(addr string) string {
 // ---- 操作 ----
 
 func (a *app) refreshPorts() {
-	ports, err := api.ListPorts()
+	ports, err := ws.ListPorts()
 	if err != nil {
 		a.appendSys("枚举串口失败: " + err.Error() + "\n")
 		return
@@ -1131,10 +1131,10 @@ func (a *app) showTcpHelp() {
 		}
 	}
 	ip := "<rkttl主机IP>"
-	if n, ok := api.PrimaryNetIf(); ok {
+	if n, ok := ws.PrimaryNetIf(); ok {
 		ip = n.IP
 	}
-	urls := api.ConsoleURLs("0.0.0.0:7373", "")
+	urls := ws.ConsoleURLs("0.0.0.0:7373", "")
 	content := fmt.Sprintf(
 		"Linux / 远端连接 TCP 桥（端口 %s，主机 %s）\r\n"+
 			"================================================================\r\n\r\n"+
@@ -1268,7 +1268,7 @@ func (a *app) applyNetwork() {
 // refreshNetIfs 重新枚举网卡并填充"对外网卡"下拉框。
 // 下标 0 为"全部网卡 (0.0.0.0)"，其后为具体网卡（物理在前，虚拟在后）。
 func (a *app) refreshNetIfs() {
-	ifs := api.ListNetIfs()
+	ifs := ws.ListNetIfs()
 	a.nicIfs = ifs
 
 	labels := make([]string, 0, len(ifs)+1)
@@ -1345,7 +1345,7 @@ func (a *app) updateURLHint() {
 	ip := ""
 	if idx := a.nicCombo.CurrentIndex(); idx > 0 && idx-1 < len(a.nicIfs) {
 		ip = a.nicIfs[idx-1].IP // 用户显式选择的网卡
-	} else if n, ok := api.PrimaryNetIf(); ok {
+	} else if n, ok := ws.PrimaryNetIf(); ok {
 		ip = n.IP // 最佳物理网卡
 	}
 	if ip == "" {

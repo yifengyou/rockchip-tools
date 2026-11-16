@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 
-	"rkttl/internal/api"
+	"rkttl/internal/ws"
 )
 
 // cmdPorts 列出本机串口（文本表格或 JSON）。
@@ -16,7 +16,7 @@ func cmdPorts(args []string) error {
 	fs.BoolVar(&asJSON, "json", false, "以 JSON 输出")
 	_ = fs.Parse(args)
 
-	ports, err := api.ListPorts()
+	ports, err := ws.ListPorts()
 	if err != nil {
 		return err
 	}

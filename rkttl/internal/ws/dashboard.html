@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rkttl 串口控制台</title>
+<link rel="stylesheet" href="/static/xterm.css">
+<style>
+  :root {
+    --bg:#1d1f21; --panel:#25282c; --fg:#c5c8c6; --dim:#8b8f94;
+    --accent:#4d9f6d; --err:#e06c75; --border:#333;
+  }
+  * { box-sizing: border-box; }
+  html, body { height:100%; margin:0; }
+  body {
+    background:var(--bg); color:var(--fg); display:flex; flex-direction:column;
+    font:13px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+  }
+  header {
+    background:var(--panel); padding:7px 12px; display:flex; flex-wrap:wrap;
+    gap:8px; align-items:center; border-bottom:1px solid var(--border);
+  }
+  header .logo { font-weight:700; color:#fff; margin-right:6px; }
+  header .logo small { color:var(--dim); font-weight:400; }
+  select, input[type=text], input[type=number] {
+    background:#1a1c1e; color:var(--fg); border:1px solid #3a3e42;
+    border-radius:4px; padding:4px 6px; font-size:13px;
+  }
+  button {
+    background:#2f3439; color:var(--fg); border:1px solid #3a3e42;
+    border-radius:4px; padding:4px 11px; cursor:pointer; font-size:13px;
+  }
+  button:hover { background:#3a4046; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.primary:hover { background:#5cb47d; }
+  button:disabled { opacity:.5; cursor:default; }
+  .spacer { flex:1; }
+  #connBadge { font-size:12px; padding:2px 8px; border-radius:10px; background:#3a2023; color:var(--err); }
+  #connBadge.up { background:#1e3a2a; color:#6ed09a; }
+  #term-wrap { flex:1; min-height:0; padding:4px 2px 0; overflow:hidden; }
+  #term { width:100%; height:100%; }
+  footer {
+    background:var(--panel); border-top:1px solid var(--border); padding:5px 12px;
+    display:flex; flex-wrap:wrap; gap:14px; align-items:center; font-size:12px; color:var(--dim);
+  }
+  footer .val { color:var(--fg); font-weight:600; }
+  footer .hint { font-size:11px; }
+  footer kbd {
+    background:var(--bg); border:1px solid var(--dim); border-bottom-width:2px;
+    border-radius:3px; padding:0 4px; font-size:10px;
+  }
+  #toast {
+    position:fixed; left:50%; top:14px; transform:translateX(-50%); background:#333; color:#fff;
+    padding:6px 16px; border-radius:6px; opacity:0; transition:opacity .25s;
+    pointer-events:none; z-index:20;
+  }
+  #toast.show { opacity:1; }
+  #mask {
+    position:fixed; inset:0; background:rgba(0,0,0,.55); display:none;
+    align-items:center; justify-content:center; z-index:30;
+  }
+  #mask.show { display:flex; }
+  #helpbox {
+    background:var(--panel); border:1px solid #3a3e42; border-radius:8px;
+    max-width:660px; width:92%; padding:16px 20px;
+  }
+  #helpbox h3 { margin:0 0 8px; color:#fff; }
+  #helpbox pre {
+    background:#1a1c1e; border:1px solid #3a3e42; border-radius:6px;
+    padding:10px 12px; overflow:auto; font:12px/1.6 Consolas,monospace;
+  }
+  #helpbox .cmd { color:#9ec97f; }
+  #helpbox .close { float:right; }
+</style>
+</head>
+<body>
+<header>
+  <span class="logo">rkttl <small>串口共享终端</small></span>
+  <select id="portSel" title="串口"></select>
+  <button id="refreshBtn" title="重新枚举串口">刷新</button>
+  <input type="number" id="baud" value="1500000" title="波特率" style="width:108px">
+  <button id="openBtn" class="primary">打开串口</button>
+  <button id="closeBtn">关闭</button>
+  <button id="flushBtn" title="清空接收缓冲与会话日志文件">清空日志</button>
+  <button id="exportBtn" title="下载完整会话日志（原始字节流）">导出日志</button>
+  <button id="clearBtn" title="仅清空屏幕显示">清屏</button>
+  <button id="helpBtn" title="远端接入方式">帮助</button>
+  <span class="spacer"></span>
+  <span id="connBadge">未连接</span>
+</header>
+
+<div id="term-wrap"><div id="term"></div></div>
+
+<footer>
+  <span id="fSerial" title="串口状态">● 未连接</span>
+  <span id="fRx" title="累计接收">RX <span class="val">0B</span></span>
+  <span id="fTx" title="累计发送">TX <span class="val">0B</span></span>
+  <span id="fSub" title="同时共享此串口的客户端数">共享 <span class="val">0</span></span>
+  <span class="spacer"></span>
+  <span class="hint">直接在终端输入 · <kbd>Ctrl+C</kbd> 会直接发送给设备</span>
+</footer>
+
+<div id="toast"></div>
+<div id="mask">
+  <div id="helpbox">
+    <button class="close" onclick="document.getElementById('mask').classList.remove('show')">关闭</button>
+    <h3>远端接入方式</h3>
+    <p>网页控制台：<span class="cmd" id="helpHttp"></span></p>
+    <p><b>TCP 桥</b>（端口以宿主机设置为准，默认 9999）：</p>
+    <pre>nc <span id="helpIp1"></span> 9999
+socat -,raw,echo=0 TCP:<span id="helpIp2"></span>:9999
+socat pty,link=/tmp/ttyrkttl,raw TCP:<span id="helpIp3"></span>:9999
+screen /tmp/ttyrkttl 1500000</pre>
+    <p><b>HTTP API</b>（脚本 / AI）：</p>
+    <pre>curl -H "Authorization: Bearer $TOKEN" http://<span id="helpIp4"></span>:7373/api/status
+curl -H "Authorization: Bearer $TOKEN" http://<span id="helpIp5"></span>:7373/api/write -d '{"data":"version","eol":"crlf"}'
+curl -H "Authorization: Bearer $TOKEN" "http://<span id="helpIp6"></span>:7373/api/read?since=0"</pre>
+  </div>
+</div>
+
+<script src="/static/xterm.js"></script>
+<script src="/static/addon-fit.js"></script>
+<script src="/static/addon-web-links.js"></script>
+<script>
+"use strict";
+
+var TOKEN = new URLSearchParams(location.search).get("token") || "";
+var term, fitAddon, ws = null, reconnectTimer = null;
+var lastSeq = 0;
+
+/* ---------------- 终端初始化 ---------------- */
+function initTerm() {
+  term = new Terminal({
+    cursorBlink: true,
+    fontSize: 13,
+    fontFamily: 'Consolas, "Cascadia Mono", "Sarasa Mono SC", "Microsoft YaHei Mono", monospace',
+    scrollback: 10000,
+    allowProposedApi: true,
+    convertEol: false,
+    theme: {
+      background: '#1d1f21', foreground: '#c5c8c6',
+      cursor: '#9ec97f', selectionBackground: '#3a4050'
+    }
+  });
+  fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  try { term.loadAddon(new WebLinksAddon.WebLinksAddon()); } catch (e) { /* 可选 */ }
+  term.open(document.getElementById('term'));
+  fitAddon.fit();
+
+  // 终端输入 -> 串口（xterm 已处理 Ctrl+C/Tab/Esc/方向键等映射）
+  term.onData(function (data) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) { return; }
+    ws.send(JSON.stringify({ type: 'input', data: data }));
+  });
+
+  // 终端尺寸变化 -> 通知设备（RS232 无窗口概念，仅记录）
+  term.onResize(function (sz) { /* no-op: 串口无终端尺寸协商 */ });
+
+  window.addEventListener('resize', function () {
+    if (fitAddon) { try { fitAddon.fit(); } catch (e) { } }
+  });
+}
+
+/* ---------------- WebSocket ---------------- */
+function wsURL() {
+  var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  var u = proto + '//' + location.host + '/ws';
+  var qs = [];
+  if (TOKEN) { qs.push('token=' + encodeURIComponent(TOKEN)); }
+  if (lastSeq > 0) { qs.push('since=' + lastSeq); }
+  return u + (qs.length ? '?' + qs.join('&') : '');
+}
+
+function connect() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  setBadge(false, '连接中…');
+
+  var sock;
+  try {
+    sock = TOKEN
+      ? new WebSocket(wsURL(), ['rkttl.v1', 'rkttl.token.' + TOKEN])
+      : new WebSocket(wsURL(), ['rkttl.v1']);
+    sock.binaryType = 'arraybuffer';
+  } catch (e) {
+    scheduleReconnect();
+    return;
+  }
+  ws = sock;
+
+  sock.onopen = function () {
+    setBadge(true, '已连接');
+    api('/api/status').then(function (r) {
+      if (r && r.ok) { renderStatus(r.data.serial, true); }
+    }).catch(function () { });
+  };
+
+  sock.onmessage = function (ev) {
+    if (typeof ev.data === 'string') {
+      handleJSON(ev.data);
+      return;
+    }
+    // 二进制帧：串口原始字节，直接喂给 xterm
+    var bytes = new Uint8Array(ev.data);
+    term.write(bytes);
+    lastSeq += bytes.length;
+    updateSeqLabel();
+  };
+
+  sock.onclose = function () {
+    setBadge(false, '已断开');
+    ws = null;
+    scheduleReconnect();
+  };
+
+  sock.onerror = function () { /* onclose 会跟进处理 */ };
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) { return; }
+  reconnectTimer = setTimeout(function () {
+    reconnectTimer = null;
+    connect();
+  }, 2000);
+}
+
+function handleJSON(text) {
+  var msg;
+  try { msg = JSON.parse(text); } catch (e) { return; }
+  switch (msg.type) {
+    case 'status':
+      if (typeof msg.seq === 'number' && msg.seq > lastSeq) { lastSeq = msg.seq; }
+      renderStatus(msg, false);
+      if (msg.event === 'opened') { term.writeln('\r\n\x1b[32m[串口已打开] ' + (msg.info || '') + '\x1b[0m'); }
+      if (msg.event === 'closed') { term.writeln('\r\n\x1b[31m[串口已断开] ' + (msg.info || '') + '\x1b[0m'); }
+      updateSeqLabel();
+      break;
+    case 'meta':
+      if (msg.truncated) {
+        term.writeln('\r\n\x1b[33m[提示] 部分历史数据已被缓冲区覆盖，以下从最新可用位置开始\x1b[0m');
+      }
+      if (typeof msg.seq === 'number') { lastSeq = msg.seq; }
+      updateSeqLabel();
+      break;
+    case 'error':
+      term.writeln('\r\n\x1b[31m[错误] ' + (msg.message || '') + '\x1b[0m');
+      break;
+    case 'pong':
+      break;
+  }
+}
+
+function updateSeqLabel() { /* 预留：可在状态栏显示 seq */ }
+
+function setBadge(up, text) {
+  var b = document.getElementById('connBadge');
+  b.textContent = text;
+  b.className = up ? 'up' : '';
+}
+
+/* ---------------- 状态渲染 ---------------- */
+function renderStatus(st, fromAPI) {
+  if (!st) { return; }
+  var el = document.getElementById('fSerial');
+  if (st.open) {
+    el.textContent = '● ' + (st.port || '') + ' @ ' + (st.baud || '');
+    el.style.color = '#6ed09a';
+    document.getElementById('openBtn').disabled = true;
+    document.getElementById('closeBtn').disabled = false;
+    if (st.port) { setPortSelection(st.port); }
+    if (st.baud) { document.getElementById('baud').value = st.baud; }
+  } else {
+    el.textContent = st.last_error ? ('● 未连接: ' + st.last_error) : '● 未连接';
+    el.style.color = '#e06c75';
+    document.getElementById('openBtn').disabled = false;
+    document.getElementById('closeBtn').disabled = true;
+  }
+  document.getElementById('fRx').innerHTML = 'RX <span class="val">' + fmtBytes(st.rx || st.received || 0) + '</span>';
+  document.getElementById('fTx').innerHTML = 'TX <span class="val">' + fmtBytes(st.tx || st.sent || 0) + '</span>';
+  document.getElementById('fSub').innerHTML = '共享 <span class="val">' + (st.subscribers || 0) + '</span>';
+}
+
+function fmtBytes(n) {
+  if (!n) { return '0B'; }
+  if (n < 1024) { return n + 'B'; }
+  if (n < 1048576) { return (n / 1024).toFixed(1) + 'K'; }
+  if (n < 1073741824) { return (n / 1048576).toFixed(1) + 'M'; }
+  return (n / 1073741824).toFixed(2) + 'G';
+}
+
+/* ---------------- HTTP API ---------------- */
+function api(path, method, body) {
+  var url = new URL(path, location.origin);
+  if (TOKEN) { url.searchParams.set('token', TOKEN); }
+  var opt = { method: method || 'GET', headers: {} };
+  if (body !== undefined) {
+    opt.headers['Content-Type'] = 'application/json';
+    opt.body = JSON.stringify(body);
+  }
+  return fetch(url.toString(), opt).then(function (r) {
+    return r.json().catch(function () { return { ok: false, error: 'HTTP ' + r.status }; });
+  });
+}
+
+function toast(msg) {
+  var t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(function () { t.classList.remove('show'); }, 2600);
+}
+
+/* ---------------- 串口列表 ---------------- */
+function loadPorts(keepSelection) {
+  return api('/api/ports').then(function (r) {
+    if (!r || !r.ok) { toast('获取串口列表失败'); return; }
+    var sel = document.getElementById('portSel');
+    var prev = keepSelection ? sel.value : '';
+    sel.innerHTML = '';
+    var ports = (r.data && r.data.ports) || [];
+    if (ports.length === 0) {
+      var o = document.createElement('option');
+      o.value = ''; o.textContent = '(未发现串口)';
+      sel.appendChild(o);
+      return;
+    }
+    ports.forEach(function (p) {
+      var o = document.createElement('option');
+      o.value = p.name;
+      var label = p.name;
+      if (p.vid && p.pid) { label += '  ' + p.vid + ':' + p.pid; }
+      if (p.product) { label += '  ' + p.product; }
+      o.textContent = label;
+      o.title = label;
+      sel.appendChild(o);
+    });
+    // 优先选中 CH340
+    var prefer = ports.filter(function (p) { return (p.vid || '').toUpperCase() === '1A86'; });
+    if (prev) { setPortSelection(prev); }
+    else if (prefer.length) { sel.value = prefer[0].name; }
+    else { sel.value = ports[0].name; }
+  });
+}
+
+function setPortSelection(name) {
+  var sel = document.getElementById('portSel');
+  for (var i = 0; i < sel.options.length; i++) {
+    if (sel.options[i].value === name) { sel.selectedIndex = i; return; }
+  }
+}
+
+function currentPortName() {
+  var sel = document.getElementById('portSel');
+  var v = sel.value || '';
+  // 选项文本带 VID/PID，value 是纯名字
+  return v.trim();
+}
+
+/* ---------------- 按钮绑定 ---------------- */
+function bindUI() {
+  document.getElementById('refreshBtn').onclick = function () {
+    loadPorts(true).then(function () { toast('串口列表已刷新'); });
+  };
+
+  document.getElementById('openBtn').onclick = function () {
+    var port = currentPortName();
+    if (!port) { toast('请先选择串口'); return; }
+    var baud = parseInt(document.getElementById('baud').value, 10) || 1500000;
+    api('/api/open', 'POST', { port: port, baud: baud }).then(function (r) {
+      if (!r.ok) { toast('打开失败: ' + r.error); return; }
+      renderStatus(r.data.serial, true);
+      term.writeln('\r\n\x1b[32m[已请求打开 ' + port + ' @ ' + baud + ']\x1b[0m');
+    });
+  };
+
+  document.getElementById('closeBtn').onclick = function () {
+    api('/api/close', 'POST').then(function (r) {
+      if (!r.ok) { toast('关闭失败: ' + r.error); return; }
+      renderStatus(r.data.serial, true);
+      term.writeln('\r\n\x1b[33m[已请求关闭串口]\x1b[0m');
+    });
+  };
+
+  document.getElementById('flushBtn').onclick = function () {
+    api('/api/flush', 'POST', { file: true }).then(function (r) {
+      if (!r.ok) { toast('清空失败: ' + r.error); return; }
+      term.clear();
+      lastSeq = (r.data && r.data.seq) || 0;
+      toast('已清空接收缓冲与会话日志');
+    });
+  };
+
+  document.getElementById('exportBtn').onclick = function () {
+    var url = new URL('/api/export', location.origin);
+    if (TOKEN) { url.searchParams.set('token', TOKEN); }
+    window.open(url.toString(), '_blank');
+  };
+
+  document.getElementById('clearBtn').onclick = function () { term.clear(); };
+
+  document.getElementById('helpBtn').onclick = function () { openHelp(); };
+
+  document.getElementById('mask').addEventListener('click', function (e) {
+    if (e.target.id === 'mask') { this.classList.remove('show'); }
+  });
+}
+
+function openHelp() {
+  var host = location.hostname;
+  var port = location.port || '7373';
+  document.getElementById('helpHttp').textContent = location.href;
+  ['helpIp1', 'helpIp2', 'helpIp3', 'helpIp4', 'helpIp5', 'helpIp6'].forEach(function (id) {
+    var el = document.getElementById(id);
+    if (el) { el.textContent = host; }
+  });
+  var h4 = document.getElementById('helpIp4');
+  if (h4 && h4.parentNode) { /* 端口已在 pre 中固定为 7373，若不同则替换 */ }
+  document.getElementById('mask').classList.add('show');
+}
+
+/* ---------------- 启动 ---------------- */
+function boot() {
+  initTerm();
+  bindUI();
+  loadPorts(false);
+  connect();
+  setInterval(function () {
+    api('/api/status').then(function (r) {
+      if (r && r.ok) { renderStatus(r.data.serial, true); }
+    }).catch(function () { });
+  }, 3000);
+}
+
+document.addEventListener('DOMContentLoaded', boot);
+</script>
+</body>
+</html>

@@ -25,10 +25,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	"rkttl/internal/api"
 	"rkttl/internal/hub"
 	"rkttl/internal/tcpbridge"
 	"rkttl/internal/version"
+	"rkttl/internal/ws"
 )
 
 func main() {
@@ -199,7 +199,7 @@ func cmdServe(args []string) error {
 	} else if token == "" {
 		token = genToken()
 	}
-	apiSrv := api.New(h, token, cfg, logger)
+	apiSrv := ws.New(h, token, cfg, logger)
 
 	var bridge *tcpbridge.Bridge
 	if tcpAddr != "" {
@@ -239,7 +239,7 @@ func printServeBanner(listen, tcpAddr, token string, h *hub.SerialHub) {
 	fmt.Println("========================================================")
 	fmt.Println(" rkttl " + version.Version + " — TTL 串口多端共享服务已启动")
 	fmt.Println("--------------------------------------------------------")
-	urls := api.ConsoleURLs(listen, token)
+	urls := ws.ConsoleURLs(listen, token)
 	if len(urls) == 0 {
 		fmt.Println("   网页控制台 : （未找到可用网卡，请检查网络）")
 	}

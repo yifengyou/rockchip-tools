@@ -1,29 +1,31 @@
 # rkttl — Rockchip TTL 串口多端共享工具
 
 把一块 **USB 转 TTL 串口适配器**（如 CH340）插在本地电脑上，通过
-**网页控制台 / HTTP API / TCP 桥** 把串口共享给远端服务器 ——
+**网页控制台（xterm.js）/ WebSocket / HTTP API / TCP 桥** 把串口共享给远端 ——
 **本地与远端可以同时收发同一串口**，效果类似 `tmux` 的多端 attach：
 
 ```
-                        ┌──────────────────────────────┐
-   USB 转 TTL (CH340)   │  rkttl（串口宿主机）          │
-   ────────────────────►│  · rkttl-gui.exe  Windows GUI │
-        COM3 @1500000   │  · rkttl serve    Linux CLI   │
-                        └───────┬──────────────┬───────┘
-                                │ HTTP+SSE      │ 裸 TCP
-              ┌─────────────────┴───┐   ┌──────┴──────────────┐
-              │ 远端服务器           │   │ 远端                 │
-              │ · 浏览器控制台(多开) │   │ nc / socat / script │
-              │ · AI Agent(API 轮询)│   │                     │
-              └─────────────────────┘   └─────────────────────┘
+                        ┌─────────────────────────────────┐
+   USB 转 TTL (CH340)   │  rkttl（串口宿主机）             │
+   ────────────────────►│  · rkttl-gui.exe  Windows GUI    │
+        COM3 @1500000   │  · rkttl serve    Linux CLI      │
+                        └───────┬───────────────┬─────────┘
+                                │ HTTP+WebSocket │ 裸 TCP
+              ┌─────────────────┴───┐   ┌──────┴──────────┐
+              │ 远端                 │   │ 远端             │
+              │ · xterm.js 控制台    │   │ nc / socat       │
+              │ · AI Agent(WebSocket)│   │                  │
+              └─────────────────────┘   └──────────────────┘
 ```
 
 - **多端共享**：GUI、浏览器（可多开）、`nc`、AI 脚本同时"attach"到同一串口，
   所有人看到同一路输出，所有人都能输入 —— 就像 `tmux attach` 同一个会话。
-- **AI 友好**：JSON API + SSE 实时流 + 全局序号(seq)游标，`curl` 即可完成
-  "打开串口 → 发命令 → 收输出"的完整控制循环，远端 AI 由此间接控制 TTL。
+- **专业终端**：网页控制台基于 [xterm.js](https://xtermjs.org/)，完整支持
+  VT100/xterm 转义、光标寻址、滚动回滚、htop/top/vim 等全屏程序。
+- **AI 友好**：JSON API + WebSocket 双向流 + 全局序号(seq)游标，`curl` /
+  `websocat` 即可完成"打开串口 → 发命令 → 收输出"的完整控制循环。
 - **两个前端**：
-  - `rkttl-gui.exe` — Windows 原生图形界面（walk/Win32，单文件 ~9MB）
+  - `rkttl-gui.exe` — Windows 原生图形界面（walk/Win32，单文件 ~10MB）
   - `rkttl` — Linux / Windows 命令行（serve / bridge / monitor / ports）
 
 Rockchip 调试串口默认 **1500000 8N1**，工具已按此预设。
@@ -45,11 +47,9 @@ Rockchip 调试串口默认 **1500000 8N1**，工具已按此预设。
 > **一律映射为 TTL 中断 0x03**（复制文本用 `Ctrl+Insert`）；
 > `Tab`/`Esc`/`Ctrl+D`/`Ctrl+U` 透传；新输出到达时未发送的输入行自动
 > 悬浮在最新内容之后。HEX 发送在 GUI"工具"菜单，网页端点 `HEX` 按钮。
-> **全屏程序（htop/top/vim 等）**：内置 VT100/xterm 子集终端引擎
-> （光标寻址/清屏/滚动区域/备用屏/反色与颜色）。网页端自动切换为
-> 彩色网格视图（行级 diff 渲染 + 光标），键盘直接映射终端序列
-> （方向键/F 键/翻页）；GUI 端检测到全屏程序时切换为屏幕快照模式
-> （纯文本快照，键盘直发），退出程序后自动恢复流式终端。
+> **全屏程序（htop/top/vim 等）**：网页控制台基于 xterm.js，
+> 原生支持完整的 VT100/xterm 转义序列（光标寻址/清屏/滚动区域/备用屏/反色与颜色），
+> htop/top/vim 等全屏程序开箱即用。
 > **操作日志**：GUI 勾选"操作日志"展开折叠面板，记录本机与远端的关键
 > 操作（串口开关/断线重连、HTTP/TCP 启停、令牌轮换、远端打开/清空/导出、
 > TCP 客户端增减），最近 500 条。
@@ -108,7 +108,7 @@ make linux          # 产出 bin/rkttl-linux-amd64
 输入框，直接打字 Enter 发送，Ctrl+C/Tab/Esc 透传，粘贴逐行执行）、清空/导出
 日志、多开共享、**?** 按钮查看 nc/socat 远端接入命令。控制台采用**流式渲染**：
 换行/退格/颜色与网络分块边界无关，逐字符回显（如 U-Boot 行编辑、退格修正）
-显示正确。**连接即回放**：网页打开时会自动收到接收缓冲中的历史日志（SSE
+显示正确。**连接即回放**：网页打开时会自动收到接收缓冲中的历史日志（WebSocket
 断线重连后按 seq 去重补齐，不重不漏）；URL 追加 `&history=N` 可只回放最近
 N 字节、`&history=0` 关闭回放。
 
@@ -140,7 +140,7 @@ socat pty,link=/tmp/ttyrkttl,raw TCP:192.168.1.10:9999
 | `/api/flush` | POST | 清空接收缓冲；`{"file":true}` 同时清空会话日志文件 |
 | `/api/export` | GET | 下载完整会话日志（日志文件优先，octet-stream） |
 | `/api/break` | POST | `{"ms":100}` 发送 break |
-| `/api/stream` | GET | SSE 实时流；连接时回放缓冲历史（`history=N` 限最近 N 字节，`0` 关闭） |
+| `/api/stream` | GET | WebSocket 实时流；连接时回放缓冲历史（`history=N` 限最近 N 字节，`0` 关闭） |
 
 #### `/api/read` 的 seq 游标（多端共享的关键）
 
@@ -174,12 +174,12 @@ curl -H "$T" "$H/api/read?since=$SEQ&wait_ms=2000" | jq -r .data.text
 curl -H "$T" $H/api/write -d '{"data":"03","hex":true}'   # Ctrl+C 中断
 ```
 
-#### SSE 实时流
+#### WebSocket 实时流
 
 ```bash
-curl -N -H "Authorization: Bearer $TOKEN" http://192.168.1.10:7373/api/stream
-# event: data
-# data: {"seq":1234,"b64":"..."}
+websocat -H="Authorization: Bearer $TOKEN" ws://192.168.1.10:7373/api/stream
+# 二进制帧：串口原始字节
+# 文本帧：JSON {type:"input",data:"..."} 或 {type:"ping"}
 ```
 
 ## 四、构建
@@ -200,7 +200,7 @@ rkttl/
 ├── cmd/rkttl/          # CLI 前端（Linux/Windows）
 ├── cmd/rkttl-gui/      # Windows GUI 前端（walk 声明式 UI）
 ├── internal/hub/       # 核心：串口生命周期 + 环形缓冲(seq) + 订阅广播
-├── internal/api/       # HTTP JSON API + SSE + 内嵌网页控制台
+├── internal/ws/        # HTTP JSON API + WebSocket + xterm.js 网页控制台
 ├── internal/tcpbridge/ # 裸 TCP 多客户端桥
 ├── internal/ansi/      # ANSI 转义清理（GUI 显示用）
 └── tools/mkicon.py     # 图标生成（无第三方依赖）
@@ -232,5 +232,5 @@ rkttl/
 make test    # 单元测试：环形缓冲 seq 语义（含随机压力）+ ANSI 清理
 ```
 
-端到端验证（PTY 模拟串口，覆盖 29 项：多客户端共享、SSE 双流、TCP 桥、
+端到端验证（PTY 模拟串口，覆盖 29 项：多客户端共享、WebSocket 双流、TCP 桥、
 鉴权、seq 游标、wait_ms、HEX、flush/close/重开等）在开发机通过。

@@ -31,12 +31,12 @@ type Bridge struct {
 	ln        net.Listener
 	conns     map[net.Conn]struct{}
 	closed    bool
-	done      chan struct{} // Start 成功后非 nil，桥结束时关闭
+	done      chan struct{}
 	acceptErr error
-	lastWarn  time.Time // 写失败提示限速
+	lastWarn  time.Time
 
 	clientMu      sync.Mutex
-	clientChanged func(n int, joined bool) // 客户端增减通知（可为 nil）
+	clientChanged func(n int, joined bool)
 }
 
 // New 创建桥。quiet 为 true 时不发送横幅/状态行。
@@ -59,13 +59,14 @@ func (b *Bridge) Start(addr string) error {
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
-		ln.Close()
+		_ = ln.Close()
 		return fmt.Errorf("桥已关闭")
 	}
 	b.ln = ln
 	done := make(chan struct{})
 	b.done = done
 	b.mu.Unlock()
+
 	go func() {
 		defer close(done)
 		b.acceptLoop(ln)
@@ -74,7 +75,7 @@ func (b *Bridge) Start(addr string) error {
 	return nil
 }
 
-// Done 返回一个通道，桥结束时关闭（Start 之前为 nil）。
+// Done 返回桥结束信号。
 func (b *Bridge) Done() <-chan struct{} {
 	b.mu.Lock()
 	d := b.done
@@ -82,7 +83,7 @@ func (b *Bridge) Done() <-chan struct{} {
 	return d
 }
 
-// ListenAndServe 在 addr 上监听并阻塞，直至 Close 或出错（CLI 用）。
+// ListenAndServe 启动并阻塞，直至 Close 或出错。
 func (b *Bridge) ListenAndServe(addr string) error {
 	if err := b.Start(addr); err != nil {
 		return err
@@ -91,28 +92,6 @@ func (b *Bridge) ListenAndServe(addr string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.acceptErr
-}
-
-func (b *Bridge) acceptLoop(ln net.Listener) {
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			b.mu.Lock()
-			stopped := b.closed
-			if !stopped {
-				b.acceptErr = err
-			}
-			b.mu.Unlock()
-			if stopped {
-				return
-			}
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				continue
-			}
-			return
-		}
-		go b.handle(conn)
-	}
 }
 
 // Close 停止监听并断开所有客户端。
@@ -129,14 +108,14 @@ func (b *Bridge) Close() {
 	b.mu.Unlock()
 
 	if ln != nil {
-		ln.Close()
+		_ = ln.Close()
 	}
 	for _, c := range conns {
-		c.Close()
+		_ = c.Close()
 	}
 }
 
-// ClientCount 返回当前连接的客户端数。
+// ClientCount 当前连接数。
 func (b *Bridge) ClientCount() int {
 	b.mu.Lock()
 	n := len(b.conns)
@@ -144,7 +123,7 @@ func (b *Bridge) ClientCount() int {
 	return n
 }
 
-// SetClientNotifier 设置客户端增减通知回调（joined=true 表示接入）。
+// SetClientNotifier 客户端增减通知。
 func (b *Bridge) SetClientNotifier(f func(n int, joined bool)) {
 	b.clientMu.Lock()
 	b.clientChanged = f
@@ -160,37 +139,55 @@ func (b *Bridge) notifyClient(n int, joined bool) {
 	}
 }
 
+func (b *Bridge) acceptLoop(ln net.Listener) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			b.mu.Lock()
+			stopped := b.closed
+			if !stopped {
+				b.acceptErr = err
+			}
+			b.mu.Unlock()
+			if stopped {
+				return
+			}
+			// 暂时性错误（如 SYN flood 下 backlog 满）：继续接受
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			return
+		}
+		go b.handle(conn)
+	}
+}
+
 func (b *Bridge) handle(conn net.Conn) {
 	if tc, ok := conn.(*net.TCPConn); ok {
-		_ = tc.SetNoDelay(true) // 交互场景降低延迟
+		_ = tc.SetNoDelay(true)
 		_ = tc.SetKeepAlivePeriod(30 * time.Second)
 	}
 
 	b.mu.Lock()
-	if b.closed {
-		b.mu.Unlock()
-		conn.Close()
-		return
-	}
 	b.conns[conn] = struct{}{}
 	n := len(b.conns)
 	b.mu.Unlock()
 	b.notifyClient(n, true)
+
 	remove := func() {
 		b.mu.Lock()
 		delete(b.conns, conn)
 		n := len(b.conns)
 		b.mu.Unlock()
-		conn.Close()
+		_ = conn.Close()
 		b.notifyClient(n, false)
 	}
 	defer remove()
 
 	st := b.hub.Status()
 	b.sendLine(conn, fmt.Sprintf("rkttl v%s tcp bridge | serial: %s @ %d | open=%v | clients=%d",
-		version.Version, serialDesc(st), st.DefaultBaud, st.Open, b.ClientCount()))
+		version.Version, serialDesc(st), st.Baud, st.Open, b.ClientCount()))
 
-	// 串口未打开时尝试按默认配置打开（bridge 模式的常见诉求）
 	if b.autoOpen && !b.hub.IsOpen() {
 		if def := b.hub.Default(); def.Port != "" {
 			if err := b.hub.Open(def); err != nil {
@@ -220,13 +217,13 @@ func (b *Bridge) handle(conn net.Conn) {
 	}()
 
 	// 串口 -> 客户端
-	ch := b.hub.Subscribe()
-	defer b.hub.Unsubscribe(ch)
+	sub := b.hub.Subscribe()
+	defer b.hub.Unsubscribe(sub)
 	for {
 		select {
 		case <-done:
 			return
-		case ev := <-ch:
+		case ev := <-sub:
 			switch ev.Type {
 			case "data":
 				if _, err := conn.Write(ev.Data); err != nil {
@@ -252,7 +249,6 @@ func (b *Bridge) sendLine(conn net.Conn, s string) {
 	_, _ = conn.Write([]byte(s + "\r\n"))
 }
 
-// warnRateLimited 限制重复告警的频率，避免刷屏。
 func (b *Bridge) warnRateLimited(conn net.Conn, msg string) {
 	if b.quiet {
 		return

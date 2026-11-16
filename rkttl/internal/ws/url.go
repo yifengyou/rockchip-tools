@@ -1,4 +1,10 @@
-package api
+// Package ws 提供 rkttl 的 WebSocket 服务层：实时串口收发 + xterm.js 网页控制台。
+//
+// 与旧的 SSE + HTTP POST 组合不同，WebSocket 是全双工单连接：
+//   - 服务器通过二进制帧推送串口原始字节（无需 base64）
+//   - 客户端通过文本命令或二进制帧发送输入
+//   - 断线后自动重连，客户端通过 seq 游标从环形缓冲补齐历史
+package ws
 
 import (
 	"fmt"
@@ -14,13 +20,13 @@ import (
 type PortInfo struct {
 	Name         string `json:"name"`
 	IsUSB        bool   `json:"is_usb"`
-	VID          string `json:"vid,omitempty"` // USB 厂商 ID（十六进制），如 "1A86"
-	PID          string `json:"pid,omitempty"` // USB 产品 ID（十六进制），如 "7523"
+	VID          string `json:"vid,omitempty"`
+	PID          string `json:"pid,omitempty"`
 	SerialNumber string `json:"serial_number,omitempty"`
-	Product      string `json:"product,omitempty"` // 设备描述，如 "USB-SERIAL CH340"
+	Product      string `json:"product,omitempty"`
 }
 
-// ListPorts 枚举本机串口，优先返回带 USB 详情的列表，失败时退回裸名称列表。
+// ListPorts 枚举本机串口。
 func ListPorts() ([]PortInfo, error) {
 	details, err := enumerator.GetDetailedPortsList()
 	if err != nil {
@@ -50,20 +56,19 @@ func ListPorts() ([]PortInfo, error) {
 
 // NetIf 描述一个带 IPv4 地址的网卡。
 type NetIf struct {
-	Name      string `json:"name"`       // 接口名（Windows 为友好名称，如 "以太网"）
-	IP        string `json:"ip"`         // 该接口的 IPv4 地址
-	IsVirtual bool   `json:"is_virtual"` // 疑似虚拟网卡（远端通常不可达）
+	Name      string `json:"name"`
+	IP        string `json:"ip"`
+	IsVirtual bool   `json:"is_virtual"`
 }
 
 // ConsoleURL 是一个可供远端访问的网页控制台地址。
 type ConsoleURL struct {
-	Name      string `json:"name,omitempty"` // 所属网卡名（监听 0.0.0.0 时给出）
+	Name      string `json:"name,omitempty"`
 	IP        string `json:"ip"`
 	URL       string `json:"url"`
 	IsVirtual bool   `json:"is_virtual,omitempty"`
 }
 
-// virtualKeywords 是常见虚拟/隧道网卡的名称关键字（不区分大小写）。
 var virtualKeywords = []string{
 	"vmware", "vmnet", "virtualbox", "vbox",
 	"vethernet", "hyper-v", "msloop", "npcap", "wsl",
@@ -73,7 +78,6 @@ var virtualKeywords = []string{
 	"easytier",
 }
 
-// isVirtualNIC 根据接口名与标志判断是否疑似虚拟网卡。
 func isVirtualNIC(name string, flags net.Flags) bool {
 	n := strings.ToLower(name)
 	for _, kw := range virtualKeywords {
@@ -81,8 +85,6 @@ func isVirtualNIC(name string, flags net.Flags) bool {
 			return true
 		}
 	}
-	// 点对点且无广播标志的接口通常是 tun/VPN 隧道
-	// （物理以太网/无线网卡都有广播标志）
 	if flags&net.FlagPointToPoint != 0 && flags&net.FlagBroadcast == 0 {
 		return true
 	}
@@ -90,7 +92,6 @@ func isVirtualNIC(name string, flags net.Flags) bool {
 }
 
 // ListNetIfs 枚举所有处于 UP 状态、带 IPv4 地址的非 loopback 网卡。
-// 物理网卡排在虚拟网卡之前；每个接口取第一个 IPv4 地址。
 func ListNetIfs() []NetIf {
 	ifis, err := net.Interfaces()
 	if err != nil {
@@ -126,8 +127,7 @@ func ListNetIfs() []NetIf {
 	return out
 }
 
-// PrimaryNetIf 返回"最可能对远端有效"的网卡：第一个非虚拟网卡，
-// 全部为虚拟网卡时退回第一个。
+// PrimaryNetIf 返回"最可能对远端有效"的网卡。
 func PrimaryNetIf() (NetIf, bool) {
 	ifs := ListNetIfs()
 	if len(ifs) == 0 {
@@ -141,9 +141,7 @@ func PrimaryNetIf() (NetIf, bool) {
 	return ifs[0], true
 }
 
-// ConsoleURLs 根据监听地址枚举可供远端访问的网页控制台地址：
-//   - 监听具体 IP 时仅返回该地址；
-//   - 监听 0.0.0.0/:: 时逐网卡列出（物理在前），并标记虚拟网卡。
+// ConsoleURLs 根据监听地址枚举可供远端访问的网页控制台地址。
 func ConsoleURLs(listenAddr, token string) []ConsoleURL {
 	host, port, err := net.SplitHostPort(listenAddr)
 	if err != nil {

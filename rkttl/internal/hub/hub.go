@@ -1,11 +1,20 @@
 // Package hub 实现 rkttl 的"串口多端共享"核心。
 //
 // 一个串口由一个 SerialHub 统一管理：串口接收的数据会同时
-//  1. 写入按全局序号(seq)索引的环形缓冲，供 HTTP API 非破坏性轮询；
+//  1. 写入按全局序号(seq)索引的环形缓冲，供 HTTP/WS 客户端非破坏性读取；
 //  2. 广播给所有订阅者（本地 GUI、网页控制台、TCP 桥、本地 monitor）；
 //
 // 任意订阅者的写入都会被送进串口 —— 达到类似 tmux 多端 attach 的效果：
 // 本地与远端可以同时看到同一路输入输出，并且都能输入。
+//
+// # 并发模型
+//
+//   - 每个"打开"的生命周期由一个 epoch 标识；rxLoop 持有创建它时的
+//     epoch，任何回调前先校验 epoch，陈旧循环直接退出，绝不操作新连接。
+//   - mu 保护 port/cfg/open/lastErr/epoch 等状态；ring 与 subs 各有独立
+//     锁，读循环不持 mu 做 I/O，避免 UI/网络路径被串口 I/O 阻塞。
+//   - 写入串行化（writeMu），保证单一客户端的多字节命令不被其它客户端
+//     的写入切碎到字节级交错。
 package hub
 
 import (
@@ -30,6 +39,9 @@ const (
 	readTimeout = 500 * time.Millisecond
 	// readWaitCap 限制 API 读取的最长等待时间。
 	readWaitCap = 60 * time.Second
+	// reopenMinDelay / reopenMaxDelay 是自动重连的退避区间。
+	reopenMinDelay = 500 * time.Millisecond
+	reopenMaxDelay = 8 * time.Second
 )
 
 // Event 是推送给订阅者的事件。
@@ -38,6 +50,7 @@ type Event struct {
 	Data []byte // 仅 data 事件携带串口原始数据
 	Seq  uint64 // data 事件：该批数据末端的 seq
 	Info string // opened/closed 事件的状态说明（如错误原因）
+	Epoch uint64 // 事件所属连接生命周期
 	At   time.Time
 }
 
@@ -92,17 +105,15 @@ type Status struct {
 // SerialHub 管理单个串口连接的生命周期、缓冲与订阅广播。
 // 它可被安全地并发使用。
 type SerialHub struct {
-	mu           sync.Mutex
-	port         serial.Port
-	cfg          SerialConfig
-	defCfg       SerialConfig
-	open         bool
-	closing      bool // 主动关闭中（不触发自动重连）
-	manualClosed bool // 手动关闭后抑制自动重连，直到下次显式打开
-	stopped      bool // hub 已整体停止
-	epoch        int64
-	lastErr      string
-	openedAt     time.Time
+	mu       sync.Mutex
+	port     serial.Port
+	cfg      SerialConfig
+	defCfg   SerialConfig
+	open     bool
+	stopped  bool
+	epoch    uint64 // 当前连接生命周期；每次打开/关闭递增
+	lastErr  string
+	openedAt time.Time
 
 	writeMu sync.Mutex // 串行化并发写，避免字节交错
 
@@ -124,6 +135,10 @@ type SerialHub struct {
 	logPath    string
 	logWritten uint64
 
+	// reopenCancel 用于取消正在进行中的自动重连等待。
+	reopenMu     sync.Mutex
+	reopenCancel chan struct{}
+
 	log     *log.Logger // 可为 nil
 	verbose bool
 }
@@ -143,16 +158,25 @@ func New(ringSize int, autoReopen bool, logger *log.Logger, verbose bool) *Seria
 // SetDefault 设置默认串口配置（GUI/serve 的启动参数）。
 func (h *SerialHub) SetDefault(cfg SerialConfig) {
 	cfg.Port = normalizePortName(cfg.Port)
+	cfg = cfg.withDefaults()
 	h.mu.Lock()
 	h.defCfg = cfg
 	h.mu.Unlock()
 }
 
-// SetAutoOpenEnabled 动态切换"异常断开自动重连"。
+// SetAutoReopen 动态切换"异常断开自动重连"。
 func (h *SerialHub) SetAutoReopen(enabled bool) {
 	h.mu.Lock()
 	h.autoReopen = enabled
 	h.mu.Unlock()
+}
+
+// AutoReopen 返回当前自动重连开关。
+func (h *SerialHub) AutoReopen() bool {
+	h.mu.Lock()
+	v := h.autoReopen
+	h.mu.Unlock()
+	return v
 }
 
 // Default 返回默认串口配置。
@@ -166,94 +190,111 @@ func (h *SerialHub) Default() SerialConfig {
 // Open 打开串口；若已有连接则先关闭再按新配置打开（换口/改波特率）。
 func (h *SerialHub) Open(cfg SerialConfig) error {
 	cfg.Port = normalizePortName(cfg.Port)
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.stopped {
-		return errors.New("服务已停止")
-	}
-	return h.openLocked(cfg)
-}
-
-func (h *SerialHub) openLocked(cfg SerialConfig) error {
+	cfg = cfg.withDefaults()
 	mode, err := cfg.mode()
 	if err != nil {
+		h.mu.Lock()
 		h.lastErr = err.Error()
+		h.mu.Unlock()
 		return err
 	}
-	h.stopCurrentLocked() // 主动关闭旧连接（静默）
+
+	h.mu.Lock()
+	if h.stopped {
+		h.mu.Unlock()
+		return errors.New("服务已停止")
+	}
+	h.mu.Unlock()
+
+	// 先停掉旧连接（静默，不广播 closed）
+	h.stopPort(false)
+
 	p, err := serial.Open(cfg.Port, mode)
 	if err != nil {
+		h.mu.Lock()
 		h.lastErr = err.Error()
+		h.mu.Unlock()
 		return fmt.Errorf("打开串口 %s 失败: %w", cfg.Port, err)
 	}
 	if err := p.SetReadTimeout(readTimeout); err != nil {
-		p.Close()
+		_ = p.Close()
+		h.mu.Lock()
 		h.lastErr = err.Error()
+		h.mu.Unlock()
 		return fmt.Errorf("设置串口 %s 读超时失败: %w", cfg.Port, err)
 	}
+
+	h.mu.Lock()
 	h.port = p
 	h.cfg = cfg
 	h.open = true
-	h.closing = false
-	h.manualClosed = false
+	h.epoch++
+	epoch := h.epoch
 	h.lastErr = ""
 	h.openedAt = time.Now()
+	h.mu.Unlock()
+
+	// 新连接 = 新数据流：清空缓冲（seq 从 0 重新计，避免客户端
+	// 用旧 seq 读到上一轮连接的残留数据）。
 	h.ring.Reset()
-	h.epoch++
-	// 会话日志：手动关闭后重新打开=新文件；异常断开自动重连=沿用同一文件
+
 	h.logMu.Lock()
 	h.openLogFileLocked()
 	h.logMu.Unlock()
-	epoch, port := h.epoch, p
-	go h.rxLoop(port, epoch)
+
+	go h.rxLoop(p, epoch)
+
 	h.logf("串口已打开: %s @ %d %d%s%d", cfg.Port, cfg.Baud, cfg.DataBits, parityShort(cfg.Parity), cfg.StopBits)
-	h.broadcast(Event{Type: "opened", Info: fmt.Sprintf("%s @ %d", cfg.Port, cfg.Baud), At: time.Now()})
+	h.broadcast(Event{Type: "opened", Info: fmt.Sprintf("%s @ %d", cfg.Port, cfg.Baud), Epoch: epoch, At: time.Now()})
 	return nil
 }
 
 // Close 手动关闭串口（不触发自动重连；会话日志文件随之结束）。
 func (h *SerialHub) Close() error {
-	h.mu.Lock()
-	if h.port == nil {
-		h.mu.Unlock()
+	h.cancelReopen()
+	if !h.stopPort(true) {
 		return nil
 	}
-	h.stopCurrentLocked()
-	h.manualClosed = true
-	h.mu.Unlock()
 	h.logMu.Lock()
 	h.closeLogFileLocked()
 	h.logMu.Unlock()
 	h.logf("串口已手动关闭")
-	h.broadcast(Event{Type: "closed", Info: "已手动关闭", At: time.Now()})
 	return nil
 }
 
 // Stop 停止 hub：关闭串口并抑制自动重连。用于进程退出。
 func (h *SerialHub) Stop() {
+	h.cancelReopen()
 	h.mu.Lock()
 	h.stopped = true
-	if h.port != nil {
-		h.stopCurrentLocked()
-	}
 	h.mu.Unlock()
+	h.stopPort(true)
 	h.logMu.Lock()
 	h.closeLogFileLocked()
 	h.logMu.Unlock()
-	h.broadcast(Event{Type: "closed", Info: "服务已停止", At: time.Now()})
 }
 
-// stopCurrentLocked 关闭当前串口连接（要求已持有 h.mu）。
-func (h *SerialHub) stopCurrentLocked() {
-	if h.port != nil {
-		h.closing = true
-		p := h.port
-		h.port = nil
-		h.open = false
-		h.epoch++ // 使旧接收循环的回调失效
-		p.Close()
+// stopPort 关闭当前串口连接并广播 closed。broadcast 为 true 时广播事件。
+// 返回是否确实关闭了一个连接。
+func (h *SerialHub) stopPort(broadcast bool) bool {
+	h.mu.Lock()
+	p := h.port
+	if p == nil || !h.open {
+		h.mu.Unlock()
+		return false
 	}
+	h.port = nil
 	h.open = false
+	h.epoch++
+	epoch := h.epoch
+	h.mu.Unlock()
+
+	_ = p.Close() // 关闭后 rxLoop 的 Read 立即返回错误，由 epoch 校验退出
+
+	if broadcast {
+		h.broadcast(Event{Type: "closed", Info: "已手动关闭", Epoch: epoch, At: time.Now()})
+	}
+	return true
 }
 
 // IsOpen 返回串口当前是否打开。
@@ -282,13 +323,15 @@ func (h *SerialHub) Write(b []byte) (int, error) {
 	}
 	h.writeMu.Lock()
 	n, err := p.Write(b)
-	if err == nil {
-		if derr := p.Drain(); derr != nil {
-			h.vlogf("drain: %v", derr)
-		}
-	}
+	// Drain 对交互式串口意义有限（可能阻塞到超时），失败不影响写入结果，
+	// 因此不再强制 Drain；仅记录调试日志。
 	h.writeMu.Unlock()
-	h.sent.Add(uint64(n))
+	if n > 0 {
+		h.sent.Add(uint64(n))
+	}
+	if err != nil {
+		h.vlogf("写串口失败: %v", err)
+	}
 	return n, err
 }
 
@@ -328,21 +371,19 @@ func (h *SerialHub) Seq() uint64 { return h.ring.Total() }
 func (h *SerialHub) Status() Status {
 	h.mu.Lock()
 	st := Status{
+		Open:        h.open,
 		AutoReopen:  h.autoReopen,
+		LastError:   h.lastErr,
 		DefaultPort: h.defCfg.Port,
 		DefaultBaud: h.defCfg.Baud,
 	}
 	if h.open {
-		st.Open = true
 		st.Port = h.cfg.Port
 		st.Baud = h.cfg.Baud
 		st.DataBits = h.cfg.DataBits
 		st.StopBits = h.cfg.StopBits
 		st.Parity = h.cfg.Parity
 		st.OpenedAt = h.openedAt.Format("2006-01-02 15:04:05")
-	}
-	if h.lastErr != "" {
-		st.LastError = h.lastErr
 	}
 	h.mu.Unlock()
 
@@ -360,9 +401,10 @@ func (h *SerialHub) Status() Status {
 }
 
 // Subscribe 返回一个订阅通道；不再使用时必须 Unsubscribe。
-// 通道缓冲有限，消费过慢时事件会被丢弃（data 丢弃不影响环形缓冲中的数据）。
+// 通道缓冲有限，消费过慢时事件会被丢弃（data 丢弃不影响环形缓冲中的数据，
+// 客户端可用 seq 从缓冲补齐）。
 func (h *SerialHub) Subscribe() chan Event {
-	ch := make(chan Event, 512)
+	ch := make(chan Event, 1024)
 	h.subsMu.Lock()
 	h.subs[ch] = struct{}{}
 	h.subsMu.Unlock()
@@ -383,6 +425,7 @@ func (h *SerialHub) broadcast(ev Event) {
 		select {
 		case ch <- ev:
 		default:
+			// 订阅者阻塞：丢弃该批（客户端可用 seq 从环形缓冲补齐）
 			h.subDropped.Add(1)
 		}
 	}
@@ -390,16 +433,24 @@ func (h *SerialHub) broadcast(ev Event) {
 
 // rxLoop 是串口接收循环：写入环形缓冲、会话日志文件并广播给订阅者。
 // 读超时返回 (0, nil)，继续循环即可。
-func (h *SerialHub) rxLoop(p serial.Port, epoch int64) {
-	buf := make([]byte, 4096)
+func (h *SerialHub) rxLoop(p serial.Port, epoch uint64) {
+	buf := make([]byte, 8192)
 	for {
 		n, err := p.Read(buf)
 		if n > 0 {
-			chunk := append([]byte(nil), buf[:n]...)
+			// 若已被新连接接管，丢弃本次数据并退出
+			h.mu.Lock()
+			cur := h.epoch
+			h.mu.Unlock()
+			if cur != epoch {
+				return
+			}
+			chunk := make([]byte, n)
+			copy(chunk, buf[:n])
 			h.received.Add(uint64(n))
 			seq := h.ring.Write(chunk)
 			h.writeLog(chunk)
-			h.broadcast(Event{Type: "data", Data: chunk, Seq: seq, At: time.Now()})
+			h.broadcast(Event{Type: "data", Data: chunk, Seq: seq, Epoch: epoch, At: time.Now()})
 		}
 		if err != nil {
 			h.onRxFatal(p, epoch, err)
@@ -410,48 +461,96 @@ func (h *SerialHub) rxLoop(p serial.Port, epoch int64) {
 
 // onRxFatal 处理接收循环的终止：区分"主动关闭"与"异常断开"，
 // 后者在启用 autoReopen 时触发自动重连。
-func (h *SerialHub) onRxFatal(p serial.Port, epoch int64, err error) {
+func (h *SerialHub) onRxFatal(p serial.Port, epoch uint64, err error) {
 	h.mu.Lock()
 	if h.epoch != epoch || h.port != p {
 		// 已被新的 Open/Close 接管，静默退出
 		h.mu.Unlock()
-		p.Close()
+		_ = p.Close()
 		return
 	}
 	portName := h.cfg.Port
 	h.open = false
 	h.port = nil
+	h.epoch++
+	newEpoch := h.epoch
 	h.lastErr = err.Error()
-	intentional := h.closing
-	reopen := h.autoReopen && !intentional && !h.stopped && !h.manualClosed && portName != ""
+	reopen := h.autoReopen && !h.stopped && portName != ""
+	cfg := h.cfg
 	h.mu.Unlock()
-	p.Close()
+
+	_ = p.Close()
 
 	h.logf("串口 %s 断开: %v", portName, err)
-	h.broadcast(Event{Type: "closed", Info: err.Error(), At: time.Now()})
+	h.broadcast(Event{Type: "closed", Info: err.Error(), Epoch: newEpoch, At: time.Now()})
 	if reopen {
-		go h.reopenLoop(portName)
+		go h.reopenLoop(cfg)
 	}
 }
 
-// reopenLoop 周期性尝试按原配置重新打开串口，直到成功或被接管。
-func (h *SerialHub) reopenLoop(portName string) {
-	h.logf("串口 %s 将自动重连...", portName)
-	for {
+// reopenLoop 按指数退避周期性尝试按原配置重新打开串口，直到成功或被取消。
+func (h *SerialHub) reopenLoop(cfg SerialConfig) {
+	cancel := h.newReopenCancel()
+	defer h.clearReopenCancel()
+
+	delay := reopenMinDelay
+	h.logf("串口 %s 将在异常断开后自动重连", cfg.Port)
+	for attempt := 1; ; attempt++ {
+		select {
+		case <-cancel:
+			return
+		case <-time.After(delay):
+		}
+
 		h.mu.Lock()
-		if h.stopped || h.open || h.manualClosed || !h.autoReopen {
+		if h.stopped || h.open {
 			h.mu.Unlock()
 			return
 		}
-		cfg := h.cfg
 		h.mu.Unlock()
-		if err := h.Open(cfg); err == nil {
-			return // 成功：openLocked 已广播 opened
-		} else {
-			h.vlogf("自动重连失败: %v", err)
+
+		if h.AutoReopen() == false {
+			return
 		}
-		time.Sleep(2 * time.Second)
+		if err := h.Open(cfg); err == nil {
+			h.logf("串口 %s 自动重连成功（第 %d 次尝试）", cfg.Port, attempt)
+			return
+		} else {
+			h.vlogf("自动重连失败（第 %d 次）: %v", attempt, err)
+		}
+		if delay < reopenMaxDelay {
+			delay *= 2
+			if delay > reopenMaxDelay {
+				delay = reopenMaxDelay
+			}
+		}
 	}
+}
+
+func (h *SerialHub) newReopenCancel() chan struct{} {
+	h.reopenMu.Lock()
+	defer h.reopenMu.Unlock()
+	if h.reopenCancel != nil {
+		close(h.reopenCancel)
+	}
+	c := make(chan struct{})
+	h.reopenCancel = c
+	return c
+}
+
+func (h *SerialHub) clearReopenCancel() {
+	h.reopenMu.Lock()
+	h.reopenCancel = nil
+	h.reopenMu.Unlock()
+}
+
+func (h *SerialHub) cancelReopen() {
+	h.reopenMu.Lock()
+	if h.reopenCancel != nil {
+		close(h.reopenCancel)
+		h.reopenCancel = nil
+	}
+	h.reopenMu.Unlock()
 }
 
 func (h *SerialHub) logf(format string, args ...any) {
@@ -520,7 +619,7 @@ func (h *SerialHub) openLogFileLocked() {
 // logPath/logWritten 保留用于状态显示与导出。
 func (h *SerialHub) closeLogFileLocked() {
 	if h.logFile != nil {
-		h.logFile.Close()
+		_ = h.logFile.Close()
 		h.logFile = nil
 	}
 }
@@ -549,7 +648,7 @@ func (h *SerialHub) logStatus() LogStatus {
 }
 
 // ReadLog 返回会话日志内容：优先读取日志文件（含自打开串口以来的全部
-// 数据，不受环形缓冲 1MB 上限约束）；未启用文件记录时返回当前缓冲内容。
+// 数据，不受环形缓冲上限约束）；未启用文件记录时返回当前缓冲内容。
 func (h *SerialHub) ReadLog() ([]byte, error) {
 	h.logMu.Lock()
 	path := h.logPath
@@ -573,6 +672,9 @@ func (h *SerialHub) TruncateLog() error {
 	if err := h.logFile.Truncate(0); err != nil {
 		return err
 	}
+	if _, err := h.logFile.Seek(0, 0); err != nil {
+		return err
+	}
 	h.logWritten = 0
 	return nil
 }
@@ -589,6 +691,23 @@ func (h *SerialHub) LogFileName() string {
 }
 
 // ---- 配置解析辅助 ----
+
+// withDefaults 为空字段填入合理默认值。
+func (c SerialConfig) withDefaults() SerialConfig {
+	if c.Baud == 0 {
+		c.Baud = 1500000
+	}
+	if c.DataBits == 0 {
+		c.DataBits = 8
+	}
+	if c.StopBits == 0 {
+		c.StopBits = 1
+	}
+	if strings.TrimSpace(c.Parity) == "" {
+		c.Parity = "none"
+	}
+	return c
+}
 
 // mode 把配置映射为 go.bug.st/serial 的打开参数。
 func (c SerialConfig) mode() (*serial.Mode, error) {
