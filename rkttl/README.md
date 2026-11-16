@@ -53,10 +53,19 @@ Rockchip 调试串口默认 **1500000 8N1**，工具已按此预设。
 > **操作日志**：GUI 勾选"操作日志"展开折叠面板，记录本机与远端的关键
 > 操作（串口开关/断线重连、HTTP/TCP 启停、令牌轮换、远端打开/清空/导出、
 > TCP 客户端增减），最近 500 条。
-> **终端主题**：菜单「视图」内置 12 款终端配色（默认深色 / Dracula / One
-> Dark / Nord / Monokai / Gruvbox Dark / Solarized Dark / Tokyo Night /
-> Ubuntu 紫 / Windows 终端 / Solarized Light / 纸白），作用于终端区与操作
-> 日志区；选择持久化到 exe 同目录 `rkttl-gui.json`，下次启动自动恢复。
+> **终端主题**：GUI「视图」菜单与网页端底部状态栏均内置 **20 款**终端配色
+> （默认深色 / Dracula / One Dark / Nord / Monokai / Gruvbox Dark /
+> Solarized Dark / Tokyo Night / Ubuntu 紫 / Windows 终端 / Solarized
+> Light / 纸白 / Catppuccin Mocha / Catppuccin Latte / Everforest Dark /
+> Rosé Pine / Rosé Pine Dawn / Kanagawa Wave / Ayu Dark / GitHub Light），
+> 作用于终端区与操作日志区；GUI 持久化到 `rkttl-gui.json`、网页端用
+> localStorage 记忆。
+> **XShell 风格界面**：GUI 顶部工具栏（打开/关闭串口、刷新端口、导出
+> 日志、导出屏幕、清空、HEX 发送、Ctrl+C、网页控制台、帮助）+ 底部
+> 分段状态栏（● 连接状态 / RX / TX / 共享端数 / HTTP·TCP / 当前主题）；
+> 网页端底部同样是分段状态栏 + 主题选择器。
+> **导出**：会话日志（完整原始字节流）与**屏幕内容**（当前终端显示，
+> 含 htop 快照）均可导出/下载。
 > **TCP 桥帮助**：GUI 的 TCP 桥行有 **帮助** 按钮，悬停有简短提示，点击弹出
 > nc/socat 具体连接命令（带本机实际 IP，可一键复制）。
 > GUI 的"过滤ANSI"开关只影响本地终端区显示；网页控制台支持 ANSI 彩色渲染。

@@ -21,17 +21,21 @@ func TestBasicStreamAndCarriageReturn(t *testing.T) {
 }
 
 // busybox top 风格：每帧 CUP(1,1)+清屏重绘 —— 最终帧应完整可见；
-// 持续多帧才判定全屏（单帧不触发）。
+// 持续 3 帧（6 次特征序列）才判定全屏（clear/reset 累计 4 次不触发）。
 func TestBusyboxTopFrames(t *testing.T) {
 	s := NewScreen(80, 24)
 	s.Feed("\x1b[H\x1b[J  1 [I] root 20% cpu\r\nMEM 100M/1G\r\n")
 	s.Feed("\x1b[H\x1b[J  2 [I] root 35% cpu\r\nMEM 200M/1G\r\n")
+	if s.FullScreenActive() {
+		t.Fatal("2 帧（4 次）不应触发全屏判定（防 clear+reset 误判）")
+	}
+	s.Feed("\x1b[H\x1b[J  3 [I] root 50% cpu\r\nMEM 300M/1G\r\n")
 	got := lines(s.Dump())
-	if got[0] != "  2 [I] root 35% cpu" || got[1] != "MEM 200M/1G" {
+	if got[0] != "  3 [I] root 50% cpu" || got[1] != "MEM 300M/1G" {
 		t.Fatalf("帧覆盖错误: %q", got[:2])
 	}
 	if !s.FullScreenActive() {
-		t.Fatal("持续帧重绘应触发全屏判定（2 帧 × 2 序列 = 4 次）")
+		t.Fatal("持续 3 帧重绘应触发全屏判定（6 次）")
 	}
 }
 
@@ -53,8 +57,8 @@ func TestNoFalsePositiveForShell(t *testing.T) {
 // 全屏判定衰减：序列停止后退出（GUI 恢复流式）。
 func TestFullScreenDecay(t *testing.T) {
 	s := NewScreen(80, 24)
-	// 快速喂 4 帧触发
-	for i := 0; i < 4; i++ {
+	// 快速喂 3 帧触发
+	for i := 0; i < 3; i++ {
 		s.Feed("\x1b[H\x1b[2Jtop\r\n")
 	}
 	if !s.FullScreenActive() {
@@ -64,6 +68,36 @@ func TestFullScreenDecay(t *testing.T) {
 	s.marks = nil
 	if s.FullScreenActive() {
 		t.Fatal("衰减后应退出全屏判定")
+	}
+}
+
+// clear/reset 命令语义：ED 2 清主屏并置清屏请求；RIS 同理且光标归零。
+func TestClearAndResetSemantics(t *testing.T) {
+	s := NewScreen(80, 24)
+	s.Feed("old line 1\r\nold line 2\r\n=> ")
+	// clear：\x1b[H\x1b[2J → 主屏清 + 清屏请求
+	s.Feed("\x1b[H\x1b[2J=> ")
+	if !s.ConsumeClearRequest() {
+		t.Fatal("ED 2 应产生清屏请求")
+	}
+	if s.ConsumeClearRequest() {
+		t.Fatal("清屏请求应一次性消费")
+	}
+	dump := s.Dump()
+	if strings.Contains(dump, "old line") {
+		t.Fatalf("ED 2 后主屏应清空: %q", dump)
+	}
+	// reset：RIS → 清屏请求 + 光标归零
+	s.Feed("more text")
+	s.Feed("\x1bc")
+	if !s.ConsumeClearRequest() {
+		t.Fatal("RIS 应产生清屏请求")
+	}
+	if s.Dump() != "" {
+		t.Fatalf("RIS 后主屏应清空: %q", s.Dump())
+	}
+	if s.cx != 0 || s.cy != 0 {
+		t.Fatalf("RIS 后光标应归零: %d,%d", s.cx, s.cy)
 	}
 }
 

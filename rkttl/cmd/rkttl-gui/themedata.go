@@ -34,6 +34,14 @@ var themes = []theme{
 	{Name: "Windows 终端", Bg: rgb(0x0C, 0x0C, 0x0C), Fg: rgb(0xCC, 0xCC, 0xCC)},
 	{Name: "Solarized Light", Bg: rgb(0xFD, 0xF6, 0xE3), Fg: rgb(0x65, 0x7B, 0x83)},
 	{Name: "纸白", Bg: rgb(0xFF, 0xFF, 0xFF), Fg: rgb(0x00, 0x00, 0x00)},
+	{Name: "Catppuccin Mocha", Bg: rgb(0x1E, 0x1E, 0x2E), Fg: rgb(0xCD, 0xD6, 0xF4)},
+	{Name: "Catppuccin Latte", Bg: rgb(0xEF, 0xF1, 0xF5), Fg: rgb(0x4C, 0x4F, 0x69)},
+	{Name: "Everforest Dark", Bg: rgb(0x2D, 0x35, 0x3B), Fg: rgb(0xD3, 0xC6, 0xAA)},
+	{Name: "Rosé Pine", Bg: rgb(0x19, 0x17, 0x24), Fg: rgb(0xE0, 0xDE, 0xF4)},
+	{Name: "Rosé Pine Dawn", Bg: rgb(0xFF, 0xFA, 0xF3), Fg: rgb(0x57, 0x52, 0x79)},
+	{Name: "Kanagawa Wave", Bg: rgb(0x1F, 0x1F, 0x28), Fg: rgb(0xDC, 0xD7, 0xBA)},
+	{Name: "Ayu Dark", Bg: rgb(0x0B, 0x0E, 0x14), Fg: rgb(0xBF, 0xBD, 0xB6)},
+	{Name: "GitHub Light", Bg: rgb(0xFF, 0xFF, 0xFF), Fg: rgb(0x1F, 0x23, 0x28)},
 }
 
 // defaultThemeName 返回默认主题名。
@@ -51,7 +59,8 @@ func lookupTheme(name string) (theme, bool) {
 // ---- 配置持久化（exe 同目录 rkttl-gui.json） ----
 
 type guiConfig struct {
-	Theme string `json:"theme"`
+	Theme           string `json:"theme"`
+	DisableSnapshot bool   `json:"disable_snapshot"` // 诊断：禁用全屏快照模式
 }
 
 // configPathFn 可在测试中替换，默认指向 exe 同目录。
@@ -82,11 +91,31 @@ func loadThemeConfig() string {
 	return cfg.Theme
 }
 
-func saveThemeConfig(name string) {
+// loadDisableSnapshot 读取"禁用全屏快照模式"诊断开关。
+func loadDisableSnapshot() bool {
+	p, err := configPathFn()
+	if err != nil {
+		return false
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return false
+	}
+	var cfg guiConfig
+	_ = json.Unmarshal(data, &cfg)
+	return cfg.DisableSnapshot
+}
+
+// saveGUIConfig 写入完整 GUI 配置。
+func saveGUIConfig(theme string, disableSnapshot bool) {
 	p, err := configPathFn()
 	if err != nil {
 		return
 	}
-	data, _ := json.MarshalIndent(guiConfig{Theme: name}, "", "  ")
+	data, _ := json.MarshalIndent(guiConfig{Theme: theme, DisableSnapshot: disableSnapshot}, "", "  ")
 	_ = os.WriteFile(p, data, 0o644)
+}
+
+func saveThemeConfig(name string) {
+	saveGUIConfig(name, vtDisableSnapshot.Load())
 }

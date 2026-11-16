@@ -44,26 +44,33 @@ type app struct {
 	consoleURL string // 当前对外展示的控制台地址（由所选网卡决定）
 
 	// 部件
-	portCombo  *walk.ComboBox
-	baudEdit   *walk.NumberEdit
-	ansiChk    *walk.CheckBox
-	autoChk    *walk.CheckBox
-	btnOpen    *walk.PushButton
-	logView    *walk.TextEdit
-	opChk      *walk.CheckBox // 操作日志折叠开关
-	opView     *walk.TextEdit // 操作日志视图
-	httpChk    *walk.CheckBox
-	httpAddr   *walk.LineEdit
-	httpState  *walk.Label
-	tcpChk     *walk.CheckBox
-	tcpAddr    *walk.LineEdit
-	tcpState   *walk.Label
-	nicCombo   *walk.ComboBox
-	nicIfs     []api.NetIf // nicCombo 的模型（下标 0 为"全部网卡"）
-	tokenEdit  *walk.LineEdit
-	urlHint    *walk.Label
-	logHint    *walk.Label
-	statusItem *walk.StatusBarItem
+	portCombo *walk.ComboBox
+	baudEdit  *walk.NumberEdit
+	ansiChk   *walk.CheckBox
+	autoChk   *walk.CheckBox
+	btnOpen   *walk.PushButton // 工具条"打开/关闭串口"
+	actNoSnap *walk.Action     // 诊断：禁用全屏快照模式
+	logView   *walk.TextEdit
+	opChk     *walk.CheckBox // 操作日志折叠开关
+	opView    *walk.TextEdit // 操作日志视图
+	httpChk   *walk.CheckBox
+	httpAddr  *walk.LineEdit
+	httpState *walk.Label
+	tcpChk    *walk.CheckBox
+	tcpAddr   *walk.LineEdit
+	tcpState  *walk.Label
+	nicCombo  *walk.ComboBox
+	nicIfs    []api.NetIf // nicCombo 的模型（下标 0 为"全部网卡"）
+	tokenEdit *walk.LineEdit
+	urlHint   *walk.Label
+	logHint   *walk.Label
+	// 分段状态栏（XShell 风格）
+	stSerial *walk.StatusBarItem
+	stRx     *walk.StatusBarItem
+	stTx     *walk.StatusBarItem
+	stSub    *walk.StatusBarItem
+	stNet    *walk.StatusBarItem
+	stTheme  *walk.StatusBarItem
 
 	// xshell 式终端状态
 	inputAnchor16  int    // 本地输入行起点的 UTF-16 索引（其前为串口输出/提示符）
@@ -152,18 +159,35 @@ func (a *app) run() error {
 	err := (MainWindow{
 		AssignTo: &mw,
 		Title:    "rkttl — Rockchip TTL 串口多端共享 (v" + version.Version + ")",
-		MinSize:  Size{Width: 880, Height: 580},
-		Size:     Size{Width: 1060, Height: 700},
+		MinSize:  Size{Width: 900, Height: 600},
+		Size:     Size{Width: 1100, Height: 720},
 		Font:     Font{Family: "Microsoft YaHei UI", PointSize: 9},
-		Layout:   VBox{Margins: Margins{Left: 8, Top: 8, Right: 8, Bottom: 4}, Spacing: 8},
+		Layout:   VBox{Margins: Margins{Left: 6, Top: 4, Right: 6, Bottom: 2}, Spacing: 6},
+		// XShell 风格分段状态栏
 		StatusBarItems: []StatusBarItem{
-			{AssignTo: &a.statusItem, Text: "正在初始化...", Width: 900},
+			{AssignTo: &a.stSerial, Text: "● 未连接", Width: 190},
+			{AssignTo: &a.stRx, Text: "RX 0B", Width: 96},
+			{AssignTo: &a.stTx, Text: "TX 0B", Width: 96},
+			{AssignTo: &a.stSub, Text: "共享端 0", Width: 90},
+			{AssignTo: &a.stNet, Text: "HTTP ✗ TCP ✗", Width: 150},
+			{AssignTo: &a.stTheme, Text: "主题: 默认深色", Width: 150},
 		},
+		// XShell 风格工具条：Composite+PushButton 自绘（walk ToolBar 对
+		// 无图标按钮渲染空白，PushButton 显示文本可靠）
 		MenuItems: []MenuItem{
+			Menu{
+				Text: "诊断(&D)",
+				Items: []MenuItem{
+					Action{Text: "禁用全屏快照模式（排查 reset 卡死）", Checkable: true,
+						AssignTo: &a.actNoSnap, OnTriggered: a.toggleNoSnap},
+					Action{Text: "打开配置目录", OnTriggered: a.openLogDir},
+				},
+			},
 			Menu{
 				Text: "日志(&L)",
 				Items: []MenuItem{
 					Action{Text: "导出日志...", OnTriggered: a.exportLog},
+					Action{Text: "导出屏幕内容...", OnTriggered: a.exportScreen},
 					Action{Text: "清空日志（含接收缓冲）", OnTriggered: a.clearLog},
 					Separator{},
 					Action{Text: "打开日志目录", OnTriggered: a.openLogDir},
@@ -180,6 +204,7 @@ func (a *app) run() error {
 				Text: "工具(&T)",
 				Items: []MenuItem{
 					Action{Text: "发送 HEX（解析当前输入行）", OnTriggered: a.sendHexLine},
+					Action{Text: "发送 Ctrl+C (0x03)", OnTriggered: func() { a.writeAsync([]byte{0x03}, "") }},
 					Action{Text: "发送 Break (100ms)", OnTriggered: func() {
 						go func() {
 							if err := a.hub.Break(100 * time.Millisecond); err != nil {
@@ -195,12 +220,31 @@ func (a *app) run() error {
 			},
 		},
 		Children: []Widget{
-			// —— 串口工具条 ——
+			// —— 工具条（XShell 风格：核心操作一键直达） ——
+			Composite{
+				Layout: HBox{MarginsZero: true, Spacing: 4},
+				Children: []Widget{
+					PushButton{AssignTo: &a.btnOpen, Text: "打开串口", OnClicked: a.toggleSerial,
+						MinSize: Size{Width: 84}},
+					PushButton{Text: "刷新端口", OnClicked: a.refreshPorts},
+					Label{Text: "│", TextColor: walk.RGB(128, 128, 128)},
+					PushButton{Text: "导出日志", OnClicked: a.exportLog},
+					PushButton{Text: "导出屏幕", OnClicked: a.exportScreen},
+					PushButton{Text: "清空日志", OnClicked: a.clearLog},
+					Label{Text: "│", TextColor: walk.RGB(128, 128, 128)},
+					PushButton{Text: "HEX", OnClicked: a.sendHexLine,
+						ToolTipText: "把当前输入行按十六进制解析并发送"},
+					PushButton{Text: "Ctrl+C", OnClicked: func() { a.writeAsync([]byte{0x03}, "") },
+						ToolTipText: "发送 0x03 中断信号"},
+					PushButton{Text: "帮助", OnClicked: a.showTcpHelp},
+				},
+			},
+			// —— 串口设置行（打开/关闭在工具条） ——
 			Composite{
 				Layout: HBox{MarginsZero: true, Spacing: 6},
 				Children: []Widget{
 					Label{Text: "串口:"},
-					ComboBox{AssignTo: &a.portCombo, MinSize: Size{Width: 170}},
+					ComboBox{AssignTo: &a.portCombo, MinSize: Size{Width: 190}},
 					PushButton{Text: "刷新", OnClicked: a.refreshPorts},
 					Label{Text: "波特率:"},
 					NumberEdit{
@@ -218,17 +262,13 @@ func (a *app) run() error {
 						ToolTipText: "终端区不解析颜色转义序列，仅清理显示"},
 					CheckBox{AssignTo: &a.autoChk, Text: "断线自动重连", Checked: true,
 						ToolTipText: "USB 重新插拔后自动恢复串口连接"},
-					PushButton{AssignTo: &a.btnOpen, Text: "打开串口", OnClicked: a.toggleSerial},
 				},
 			},
 			// —— 终端区（xshell 式：直接在终端末尾输入，Enter 发送） ——
 			TextEdit{
 				AssignTo: &a.logView, VScroll: true,
 				MaxLength: 0x7FFFFFF0, StretchFactor: 1,
-				Font: Font{Family: "Consolas", PointSize: 10},
-				ToolTipText: "本地与所有远端共享的串口终端：直接输入命令，Enter 发送（CR）；" +
-					"Ctrl+C 直接映射为 TTL 中断 0x03；Tab/Esc/Ctrl+D/Ctrl+U 透传；" +
-					"复制文本请用 Ctrl+Insert（选中后）",
+				Font:          Font{Family: "Consolas", PointSize: 10},
 				OnKeyDown:     a.termKeyDown,
 				OnTextChanged: a.termChanged,
 			},
@@ -245,8 +285,7 @@ func (a *app) run() error {
 			TextEdit{
 				AssignTo: &a.opView, ReadOnly: true, VScroll: true, Visible: false,
 				MinSize: Size{Height: 96}, MaxLength: 0x7FFFFFF0,
-				Font:        Font{Family: "Consolas", PointSize: 9},
-				ToolTipText: "操作日志（最近 500 条）",
+				Font: Font{Family: "Consolas", PointSize: 9},
 			},
 			// —— 网络共享 ——
 			GroupBox{
@@ -319,6 +358,12 @@ func (a *app) run() error {
 	a.refreshPorts()
 	a.refreshNetIfs()
 	a.updateSerialUI()
+	if loadDisableSnapshot() {
+		vtDisableSnapshot.Store(true)
+		if a.actNoSnap != nil {
+			_ = a.actNoSnap.SetChecked(true)
+		}
+	}
 	a.applyTheme(loadThemeConfig()) // 应用上次的终端主题（并持久化后续切换）
 	a.tokenEdit.SetText(a.apiSrv.Token())
 	// 操作日志接线：远端 API 操作 + TCP 桥客户端增减
@@ -326,6 +371,7 @@ func (a *app) run() error {
 	a.startSubscribers()
 	go a.oplogLoop()
 	go a.statusLoop()
+	a.startWatchdog()
 	if a.httpChk.Checked() {
 		a.applyNetwork() // 默认开箱即用：自动启动 HTTP 服务
 	}
@@ -408,7 +454,8 @@ func (a *app) flushPending(pending *[]byte) {
 	}
 	// 全部输出同步喂给 VT 屏幕（保持状态连续），再判断呈现模式
 	a.vtScreen.FeedBytes(data)
-	fs := a.vtScreen.FullScreenActive()
+	fs := a.vtScreen.FullScreenActive() && !vtDisableSnapshot.Load()
+	clearReq := a.vtScreen.ConsumeClearRequest()
 	a.mw.Synchronize(func() {
 		if fs {
 			a.renderSnapshot()
@@ -417,6 +464,14 @@ func (a *app) flushPending(pending *[]byte) {
 		if a.snapMode {
 			// 刚退出全屏应用：把 VT 主屏内容接回流式终端
 			a.exitSnapshot()
+		}
+		if clearReq {
+			// clear/reset 命令：清空流式终端（保留 EDIT，重置锚点）
+			a.logView.SetText("")
+			a.logLen = 0
+			a.inputAnchor16 = 0
+			a.pendingClean16 = 0
+			a.pendingLine = ""
 		}
 		text := string(data)
 		if a.ansiChk.Checked() {
@@ -449,7 +504,7 @@ func (a *app) renderSnapshot() {
 	// 光标移到末尾（EDIT 全量替换后）
 	l16 := a.logView.TextLength()
 	a.logView.SetTextSelection(l16, l16)
-	a.logView.SendMessage(win.WM_VSCROLL, win.SB_BOTTOM, 0)
+	a.scrollBottom()
 }
 
 // exitSnapshot 退出快照模式：恢复暂存的流式内容与输入锚点，
@@ -459,6 +514,15 @@ func (a *app) exitSnapshot() {
 	// 恢复进入时的流式内容
 	a.logView.SetText(a.snapSaved)
 	a.logLen = len(a.snapSaved)
+	// 清掉暂存中遗留的旧本地输入行（进入快照时未提交的部分）：
+	// 它从锚点起延伸到文本末尾，恢复前先删除，避免锚点指向错乱内容
+	if l16 := a.logView.TextLength(); a.snapAnchor16 >= 0 && a.snapAnchor16 < l16 {
+		a.logView.SetTextSelection(a.snapAnchor16, l16)
+		a.logView.ReplaceSelectedText("", false)
+		if a.logLen -= l16 - a.snapAnchor16; a.logLen < 0 {
+			a.logLen = 0
+		}
+	}
 	// 增量接回 VT 期间主屏新增内容
 	nowDmp := a.vtScreen.Dump()
 	switch {
@@ -467,11 +531,8 @@ func (a *app) exitSnapshot() {
 	case nowDmp != a.snapEnterDmp:
 		a.appendRaw(normalizeEOL(nowDmp)) // 主屏被改写（罕见）：全量接回
 	}
-	// 恢复输入锚点（用户进入前未提交的输入行位置）
-	a.inputAnchor16 = a.snapAnchor16
-	if l16 := a.logView.TextLength(); a.inputAnchor16 > l16 || a.inputAnchor16 < 0 {
-		a.inputAnchor16 = l16
-	}
+	// 恢复输入锚点（旧输入行已删除，锚点即文本末尾）
+	a.inputAnchor16 = a.logView.TextLength()
 	l16 := a.logView.TextLength()
 	a.logView.SetTextSelection(l16, l16)
 	a.appendSys("已退出全屏快照模式，恢复流式终端\n")
@@ -557,7 +618,15 @@ func (a *app) appendRaw(text string) {
 		a.logView.AppendText("[sys] 终端区已达上限，已裁剪最旧内容\r\n")
 		a.logLen += len("[sys] 终端区已达上限，已裁剪最旧内容\r\n")
 	}
-	a.logView.SendMessage(win.WM_VSCROLL, win.SB_BOTTOM, 0)
+	a.scrollBottom()
+}
+
+// scrollBottom 滚动到底部；空文本时跳过（防御：部分 EDIT 版本对
+// 空内容处理 WM_VSCROLL 行为异常）。
+func (a *app) scrollBottom() {
+	if a.logView.TextLength() > 0 {
+		a.logView.SendMessage(win.WM_VSCROLL, win.SB_BOTTOM, 0)
+	}
 }
 
 // termWrite 把一段内容写入终端：先撤下本地输入行，追加内容，
@@ -647,7 +716,7 @@ func (a *app) doPendingClean() {
 	a.inputAnchor16 = a.logView.TextLength()
 	l16 = a.logView.TextLength()
 	a.logView.SetTextSelection(l16, l16)
-	a.logView.SendMessage(win.WM_VSCROLL, win.SB_BOTTOM, 0)
+	a.scrollBottom()
 }
 
 // termChanged 是 EDIT 的 EN_CHANGE 回调：这里【只】夹紧锚点，
@@ -830,6 +899,7 @@ func (a *app) statusLoop() {
 		case <-ticker.C:
 			if a.uiAlive.Load() {
 				a.mw.Synchronize(func() {
+					heartbeat.Add(1) // UI 心跳（看门狗据此判断线程存活）
 					a.updateStatusItem()
 					a.updateLogHint()
 				})
@@ -859,37 +929,37 @@ func (a *app) updateLogHint() {
 
 func (a *app) updateStatusItem() {
 	st := a.hub.Status()
-	var b strings.Builder
+	// 分段 1：连接状态（XShell 风格 ● 标记）
 	if st.Open {
-		fmt.Fprintf(&b, "串口 %s @ %d 已连接", st.Port, st.Baud)
+		_ = a.stSerial.SetText(fmt.Sprintf("● %s @ %d", st.Port, st.Baud))
 	} else if st.LastError != "" {
-		fmt.Fprintf(&b, "串口未打开 (%s)", st.LastError)
+		_ = a.stSerial.SetText("● 未连接: " + st.LastError)
 	} else {
-		b.WriteString("串口未打开")
+		_ = a.stSerial.SetText("● 未连接")
 	}
-	fmt.Fprintf(&b, "  ·  RX %s / TX %s / 缓冲 %s", human(st.Received), human(st.Sent), human(uint64(st.Buffered)))
-	fmt.Fprintf(&b, "  ·  共享端 %d", st.Subscribers)
+	_ = a.stRx.SetText("RX " + human(st.Received))
+	_ = a.stTx.SetText("TX " + human(st.Sent))
+	_ = a.stSub.SetText(fmt.Sprintf("共享端 %d", st.Subscribers))
+	net := "HTTP ✗"
 	if a.apiRunning {
-		b.WriteString("  ·  HTTP ✓")
-	} else {
-		b.WriteString("  ·  HTTP ✗")
+		net = "HTTP ✓"
 	}
 	if a.bridgeRun {
-		fmt.Fprintf(&b, "  ·  TCP桥 ✓(%d)", a.bridge.ClientCount())
+		net += fmt.Sprintf(" TCP ✓(%d)", a.bridge.ClientCount())
 	} else {
-		b.WriteString("  ·  TCP桥 ✗")
+		net += " TCP ✗"
 	}
-	a.statusItem.SetText(b.String())
+	_ = a.stNet.SetText(net)
 }
 
 func (a *app) updateSerialUI() {
 	st := a.hub.Status()
+	text := "打开串口"
+	if st.Open {
+		text = "关闭串口"
+	}
 	if a.btnOpen != nil {
-		if st.Open {
-			a.btnOpen.SetText("关闭串口")
-		} else {
-			a.btnOpen.SetText("打开串口")
-		}
+		a.btnOpen.SetText(text)
 	}
 	a.updateStatusItem()
 }
@@ -1352,6 +1422,33 @@ func (a *app) exportLog() {
 	a.appendSys(fmt.Sprintf("日志已导出: %s（%s）\n", dlg.FilePath, human(uint64(len(data)))))
 }
 
+// exportScreen 导出当前终端屏幕的显示内容（纯文本，含快照模式下的
+// htop/top 屏幕快照）。
+func (a *app) exportScreen() {
+	text := strings.ReplaceAll(a.logView.Text(), "\r\n", "\n")
+	if strings.TrimSpace(text) == "" {
+		a.msgBoxError("当前屏幕没有内容")
+		return
+	}
+	dlg := new(walk.FileDialog)
+	dlg.Title = "导出屏幕内容"
+	dlg.FilePath = "rkttl-screen-" + time.Now().Format("20060102-150405") + ".txt"
+	accepted, err := dlg.ShowSave(a.mw)
+	if err != nil {
+		a.msgBoxError("打开保存对话框失败: " + err.Error())
+		return
+	}
+	if !accepted {
+		return
+	}
+	if err := os.WriteFile(dlg.FilePath, []byte(text), 0o644); err != nil {
+		a.msgBoxError("写入文件失败: " + err.Error())
+		return
+	}
+	a.oplog.Log("已导出屏幕内容: %s", dlg.FilePath)
+	a.appendSys(fmt.Sprintf("屏幕内容已导出: %s\n", dlg.FilePath))
+}
+
 // clearLog 清空接收缓冲并截断会话日志文件（文件句柄保持，继续记录新数据）。
 func (a *app) clearLog() {
 	a.hub.FlushBuffer()
@@ -1375,6 +1472,21 @@ func (a *app) openLogDir() {
 	_ = os.MkdirAll(dir, 0o755)
 	if err := exec.Command("explorer", dir).Start(); err != nil {
 		a.msgBoxError("打开目录失败: " + err.Error())
+	}
+}
+
+// toggleNoSnap 切换"禁用全屏快照模式"诊断开关（持久化）。
+func (a *app) toggleNoSnap() {
+	v := a.actNoSnap.Checked()
+	vtDisableSnapshot.Store(v)
+	saveGUIConfig(a.curTheme, v)
+	if v {
+		a.appendSys("已禁用全屏快照模式（诊断模式）：htop/top 将以流式显示，若 reset 不再卡死请反馈开发者\n")
+		if a.snapMode {
+			a.exitSnapshot()
+		}
+	} else {
+		a.appendSys("已恢复全屏快照模式\n")
 	}
 }
 

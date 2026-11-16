@@ -15,6 +15,7 @@ package vt
 
 import (
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -23,6 +24,8 @@ import (
 // 备用屏（alternate）为固定网格；htop 等通过 ?1049h 切换到备用屏。
 type Screen struct {
 	Cols, Rows int
+
+	mu sync.Mutex // 保护全部可变状态（GUI: 后台 Feed 与 UI 线程 Dump 并发）
 
 	lines [][]rune // 主屏（含历史行）
 	alt   [][]rune // 备用屏（固定 Rows 行）
@@ -36,9 +39,12 @@ type Screen struct {
 	autowrap  pendingWrap
 
 	// 全屏应用检测：记录最近的光标寻址/清屏序列时间戳，
-	// 密集出现（2.5s 内 ≥4 次；全屏程序每帧至少 2 次）才判定为
-	// 全屏 —— 普通 shell 的行编辑、单次 clear 命令不会误触发。
+	// 密集出现（2.5s 内 ≥6 次；全屏程序每帧至少 2 次、约 3 帧）才判定为
+	// 全屏 —— 普通 shell 的行编辑、clear/reset 命令不会误触发。
 	marks []time.Time
+
+	// 主屏清屏请求（RIS / ED 2、3），由呈现层消费
+	clearReq bool
 
 	lastOut time.Time
 
@@ -74,8 +80,10 @@ func (s *Screen) Feed(text string) {
 
 // FeedBytes 输入原始字节流：数据块可为任意字节边界（如网络分包），
 // 不完整的 UTF-8 多字节序列会被缓冲到下一块，保证任意分块与
-// 整块输入结果一致。
+// 整块输入结果一致。线程安全。
 func (s *Screen) FeedBytes(p []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	buf := s.partial
 	buf = append(buf, p...)
 	s.partial = nil
@@ -484,8 +492,23 @@ func (s *Screen) parseEscape(rs []rune) (int, bool) {
 			}
 		}
 		return 2, true
-	case 'c': // RIS 全复位
-		s.resetSoft()
+	case '(', ')', '*', '+':
+		// 字符集声明（如 \x1b(B / \x1b)0，reset 命令必发）：
+		// 消耗 3 字符，否则末字符会泄漏为可见杂字符
+		if len(rs) >= 3 {
+			return 3, true
+		}
+		return 0, false
+	case 'c': // RIS 全复位（reset 命令）：清屏、光标归零
+		for i := range s.alt {
+			s.alt[i] = []rune{}
+		}
+		s.clearPrimaryLocked()
+		s.altActive = false
+		s.acx, s.acy = 0, 0
+		s.top, s.bot = 0, 0
+		s.marks = nil // reset 意图是恢复默认终端：清零全屏特征，避免误判
+		s.requestClear()
 		return 2, true
 	default:
 		return 2, true // 其他两字节转义：忽略
@@ -513,9 +536,14 @@ func (s *Screen) resetSoft() {
 		s.alt[i] = []rune{}
 	}
 	s.altActive = false
-	s.cx, s.cy = 0, 0
 	s.acx, s.acy = 0, 0
 	s.top, s.bot = 0, 0
+}
+
+// clearPrimaryLocked 清空主屏并把光标移回原点（RIS / ED 2 的清屏语义）。
+func (s *Screen) clearPrimaryLocked() {
+	s.lines = [][]rune{{}}
+	s.cx, s.cy = 0, 0
 }
 
 // execCSI 执行一条 CSI 序列。params 为分号前的原始参数串。
@@ -579,6 +607,10 @@ func (s *Screen) execCSI(priv, params string, final rune) {
 	case 'J': // ED
 		s.markFullScreen()
 		s.eraseDisplay(n1(0))
+		// 主屏全清（clear 命令）→ 通知呈现层清空显示
+		if !s.altActive && (n1(0) == 2 || n1(0) == 3) {
+			s.requestClear()
+		}
 	case 'K': // EL
 		s.eraseLine(n1(0))
 	case 'L': // IL
@@ -688,8 +720,15 @@ func (s *Screen) markFullScreen() {
 }
 
 // FullScreenActive 返回当前是否应按"全屏应用"呈现：
-// 备用屏激活，或 2.5 秒内出现 ≥4 次特征序列（持续帧重绘）。
+// 备用屏激活，或 2.5 秒内出现 ≥6 次特征序列（约 3 帧，持续帧重绘）。
+// 普通 shell 的 clear/reset（各 2 次、累计 4）不会误触发。线程安全。
 func (s *Screen) FullScreenActive() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fullScreenActiveLocked()
+}
+
+func (s *Screen) fullScreenActiveLocked() bool {
 	if s.altActive {
 		return true
 	}
@@ -701,15 +740,38 @@ func (s *Screen) FullScreenActive() bool {
 		}
 		n++
 	}
-	return n >= 4
+	return n >= 6
 }
 
-// AltActive 返回备用屏是否激活。
-func (s *Screen) AltActive() bool { return s.altActive }
+// clearReq 记录"出现了面向主屏的清屏请求"（RIS / ED 2、3），
+// 由呈现层（GUI 流式终端）消费后清空显示。
+func (s *Screen) requestClear() { s.clearReq = true }
+
+// ConsumeClearRequest 读取并清除清屏请求标志。线程安全。
+func (s *Screen) ConsumeClearRequest() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v := s.clearReq
+	s.clearReq = false
+	return v
+}
+
+// AltActive 返回备用屏是否激活。线程安全。
+func (s *Screen) AltActive() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.altActive
+}
 
 // Dump 返回当前呈现的文本（备用屏优先；主屏为可视区）。
-// 行尾空白被裁剪，行以 \n 连接。
+// 行尾空白被裁剪，行以 \n 连接。线程安全。
 func (s *Screen) Dump() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dumpLocked()
+}
+
+func (s *Screen) dumpLocked() string {
 	if s.altActive {
 		var b strings.Builder
 		for y, line := range s.alt {

@@ -71,6 +71,9 @@ func (a *app) applyTheme(name string) {
 	a.themeBrush = brush
 
 	saveThemeConfig(name)
+	if a.stTheme != nil {
+		_ = a.stTheme.SetText("主题: " + name)
+	}
 	if prev != "" && prev != name {
 		a.appendSys("终端主题已切换: " + name + "\n")
 	}

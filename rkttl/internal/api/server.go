@@ -193,6 +193,9 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// 控制台页面禁用缓存：确保升级 rkttl 后浏览器总是拿到最新页面，
+	// 避免旧版页面与新服务端的兼容问题。
+	w.Header().Set("Cache-Control", "no-cache, must-revalidate")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = io.WriteString(w, dashboardHTML)
 }
