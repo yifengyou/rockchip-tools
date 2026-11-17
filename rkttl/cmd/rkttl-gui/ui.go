@@ -205,7 +205,6 @@ func (a *app) run() error {
 				Text: "工具(&T)",
 				Items: []MenuItem{
 					Action{Text: "发送 HEX（解析当前输入行）", OnTriggered: a.sendHexLine},
-					Action{Text: "发送 Ctrl+C (0x03)", OnTriggered: func() { a.writeAsync([]byte{0x03}, "") }},
 					Action{Text: "发送 Break (100ms)", OnTriggered: func() {
 						go func() {
 							if err := a.hub.Break(100 * time.Millisecond); err != nil {
@@ -231,12 +230,13 @@ func (a *app) run() error {
 					Label{Text: "│", TextColor: walk.RGB(128, 128, 128)},
 					PushButton{Text: "导出日志", OnClicked: a.exportLog},
 					PushButton{Text: "导出屏幕", OnClicked: a.exportScreen},
-					PushButton{Text: "清空日志", OnClicked: a.clearLog},
+					PushButton{Text: "清空日志", OnClicked: a.clearLog,
+						ToolTipText: "清空接收缓冲与会话日志文件"},
+					PushButton{Text: "清屏", OnClicked: a.clearScreen,
+						ToolTipText: "仅清空屏幕显示（保留接收缓冲与日志，设备端不受影响）"},
 					Label{Text: "│", TextColor: walk.RGB(128, 128, 128)},
 					PushButton{Text: "HEX", OnClicked: a.sendHexLine,
 						ToolTipText: "把当前输入行按十六进制解析并发送"},
-					PushButton{Text: "Ctrl+C", OnClicked: func() { a.writeAsync([]byte{0x03}, "") },
-						ToolTipText: "发送 0x03 中断信号"},
 					PushButton{Text: "帮助", OnClicked: a.showTcpHelp},
 				},
 			},
@@ -1563,6 +1563,21 @@ func (a *app) exportScreen() {
 }
 
 // clearLog 清空接收缓冲并截断会话日志文件（文件句柄保持，继续记录新数据）。
+// clearScreen 仅清空屏幕显示（保留接收缓冲与会话日志，设备端不受影响）。
+// 快照模式下先退出快照再清屏，避免与 renderSnapshot 竞争。
+func (a *app) clearScreen() {
+	if a.snapMode {
+		a.exitSnapshot()
+	}
+	a.logView.SetText("")
+	a.logLen = 0
+	a.inputAnchor16 = 0
+	a.pendingClean16 = 0
+	a.pendingLine = ""
+	a.oplog.Log("已清屏（仅显示）")
+}
+
+// clearLog 清空接收缓冲与会话日志文件（影响数据，不影响显示）。
 func (a *app) clearLog() {
 	a.hub.FlushBuffer()
 	if err := a.hub.TruncateLog(); err != nil {
