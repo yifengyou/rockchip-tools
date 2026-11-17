@@ -790,8 +790,10 @@ func (a *app) doPendingClean() {
 	if tail != line+"\r\n" {
 		return // 状态不符（期间被改写）：放弃清理
 	}
+	// 删除 device echo 的 line+\r\n，但保留用户输入行
 	a.removeTail(n16)
-	a.inputAnchor16 = a.logView.TextLength()
+	// 锚点指向"删除后"的位置（即用户输入行的起点）
+	a.inputAnchor16 = a.logView.TextLength() - utf16Len(line)
 	l16 = a.logView.TextLength()
 	a.logView.SetTextSelection(l16, l16)
 	a.scrollBottom()
