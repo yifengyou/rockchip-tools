@@ -501,6 +501,8 @@ func (a *app) flushPending(pending *[]byte) {
 // renderSnapshot 快照渲染：htop/top 等全屏程序用 VT 网格的纯文本快照
 // 整体刷新终端区（EDIT 控件无法网格渲染；快照保证可读不乱码），节流 300ms。
 // 进入时暂存流式内容并记录 VT 主屏基线，退出时恢复并只接回增量。
+// 关键优化：直接 SetText(dump) 而不先取 Text() 比较 —— 快照内容必然不同，
+// 取完整文本做比较既浪费又增加 SendMessage 重入风险。
 func (a *app) renderSnapshot() {
 	if !a.snapMode {
 		a.snapMode = true
@@ -516,6 +518,8 @@ func (a *app) renderSnapshot() {
 	}
 	a.lastSnap = time.Now()
 	dump := normalizeEOL(a.vtScreen.Dump())
+	// 直接 SetText：快照内容必然与流式内容不同，无需 walk.SetText 内部的
+	// te.Text() 比较（WM_GETTEXT 复制完整文本 + 字符串比较，大文本开销大）
 	a.logView.SetText(dump)
 	a.logLen = len(dump)
 	// 光标移到末尾（EDIT 全量替换后）
@@ -526,26 +530,38 @@ func (a *app) renderSnapshot() {
 
 // exitSnapshot 退出快照模式：恢复暂存的流式内容与输入锚点，
 // 把 VT 期间主屏新增的内容增量接回（不重复、不丢历史）。
+// 关键：先把暂存内容取到本地变量再清空标志位，避免 Synchronize 队列里
+// 排在后面的 renderSnapshot 读到空暂存而 SetText("") 造成闪屏/状态错乱。
 func (a *app) exitSnapshot() {
+	// 先取暂存内容到本地变量，再清标志位。清空后队列里排队的 renderSnapshot
+	// 会因 snapMode=false 走流式路径，不会读到空暂存。
+	saved := a.snapSaved
+	anchor16 := a.snapAnchor16
+	enterDmp := a.snapEnterDmp
+
 	a.snapMode = false
+	a.snapSaved = ""
+	a.snapEnterDmp = ""
+	a.snapAnchor16 = 0
+
 	// 恢复进入时的流式内容
-	a.logView.SetText(a.snapSaved)
-	a.logLen = len(a.snapSaved)
+	a.logView.SetText(saved)
+	a.logLen = len(saved)
 	// 清掉暂存中遗留的旧本地输入行（进入快照时未提交的部分）：
 	// 它从锚点起延伸到文本末尾，恢复前先删除，避免锚点指向错乱内容
-	if l16 := a.logView.TextLength(); a.snapAnchor16 >= 0 && a.snapAnchor16 < l16 {
-		a.logView.SetTextSelection(a.snapAnchor16, l16)
+	if l16 := a.logView.TextLength(); anchor16 >= 0 && anchor16 < l16 {
+		a.logView.SetTextSelection(anchor16, l16)
 		a.logView.ReplaceSelectedText("", false)
-		if a.logLen -= l16 - a.snapAnchor16; a.logLen < 0 {
+		if a.logLen -= l16 - anchor16; a.logLen < 0 {
 			a.logLen = 0
 		}
 	}
 	// 增量接回 VT 期间主屏新增内容
 	nowDmp := a.vtScreen.Dump()
 	switch {
-	case len(nowDmp) > len(a.snapEnterDmp) && strings.HasPrefix(nowDmp, a.snapEnterDmp):
-		a.appendRaw(normalizeEOL(nowDmp[len(a.snapEnterDmp):]))
-	case nowDmp != a.snapEnterDmp:
+	case len(nowDmp) > len(enterDmp) && strings.HasPrefix(nowDmp, enterDmp):
+		a.appendRaw(normalizeEOL(nowDmp[len(enterDmp):]))
+	case nowDmp != enterDmp:
 		a.appendRaw(normalizeEOL(nowDmp)) // 主屏被改写（罕见）：全量接回
 	}
 	// 恢复输入锚点（旧输入行已删除，锚点即文本末尾）
@@ -648,11 +664,22 @@ func (a *app) scrollBottom() {
 
 // termWrite 把一段内容写入终端：先撤下本地输入行，追加内容，
 // 再把输入行放回末尾并重置锚点，光标移到输入行尾。
+// 快照模式（全屏程序）下不管理输入行，直接追加到末尾（renderSnapshot 会覆盖）。
 // 锚点（inputAnchor16）标记"串口输出与本地输入的分界"：
 // 其后是用户敲入未提交的字符，提交时只发送这部分 —— 修复把
 // 设备提示符（如 "=> "）一并当作输入发送的乱码问题。
 func (a *app) termWrite(text string, isSys bool) {
 	if a.logView == nil || text == "" {
+		return
+	}
+	// 快照模式下：EDIT 被 renderSnapshot 全量刷新，无需管理输入行，
+	// 也不做 doPendingClean/removeTail —— 避免与 SetText 竞争 EDIT 内部状态。
+	if a.snapMode {
+		if isSys {
+			a.appendRaw("[sys] " + text)
+		} else {
+			a.appendRaw(text)
+		}
 		return
 	}
 	// 先清掉未完成的提交残留（本处在消息循环闭包栈，安全）
@@ -690,6 +717,12 @@ func (a *app) appendSys(s string) {
 // EDIT 文本（Win32 EDIT 在该栈内再改文本会内部状态损坏/死循环），
 // 清理延后到安全栈（下次按键、输出渲染或兜底定时）执行。
 func (a *app) termSubmit() {
+	// 快照模式（全屏程序）：无本地输入行概念，回车只发 0x0d，
+	// 不做输入行管理（doPendingClean/removeTail 会与 renderSnapshot 的 SetText 竞争）。
+	if a.snapMode {
+		a.writeAsync([]byte("\r"), "")
+		return
+	}
 	// 先清掉上一笔提交的残留（本处在 WM_KEYDOWN 栈，安全）
 	a.doPendingClean()
 	// 光标移到末尾，确保 EDIT 默认的 \r\n 插在输入行之后
@@ -747,12 +780,18 @@ func (a *app) termChanged() {
 
 // writeAsync 在后台 goroutine 写串口（串口 Write/Drain 可能阻塞，
 // 必须移出 UI 线程，否则快速按键会导致窗口假死）。
+// 快照模式下失败不再调 appendSys 清屏提示（会破坏 renderSnapshot 的快照内容）。
 func (a *app) writeAsync(payload []byte, lineForMsg string) {
 	go func() {
 		if _, err := a.hub.Write(payload); err != nil {
 			if a.uiAlive.Load() {
 				a.mw.Synchronize(func() {
-					a.appendSys("发送失败: " + err.Error() + "\n")
+					// 快照模式下只记操作日志，不写入终端区（避免破坏快照）
+					if a.snapMode {
+						a.oplog.Log("快照模式发送失败: %v", err)
+					} else {
+						a.appendSys("发送失败: " + err.Error() + "\n")
+					}
 				})
 			}
 		}
@@ -769,6 +808,7 @@ func (a *app) termKeyDown(key walk.Key) {
 	// —— 快照模式（htop/top 等全屏程序）：按键即终端序列 ——
 	if a.snapMode {
 		ctrl := walk.ModifiersDown()&walk.ModControl != 0
+		shift := walk.ModifiersDown()&walk.ModShift != 0
 		switch key {
 		case walk.KeyReturn:
 			sendByte(0x0d)
@@ -814,23 +854,79 @@ func (a *app) termKeyDown(key walk.Key) {
 			sendStr("\x1b[20~")
 		case walk.KeyF10:
 			sendStr("\x1b[21~")
+		case walk.KeyTab:
+			sendByte(0x09)
+		case walk.KeyEscape:
+			sendByte(0x1b)
+		case walk.KeySpace:
+			sendByte(0x20)
 		default:
 			if ctrl {
+				// Ctrl 组合键：映射到常用控制字节
 				switch key {
+				case walk.KeyA:
+					sendByte(0x01) // ^A
+				case walk.KeyB:
+					sendByte(0x02) // ^B
 				case walk.KeyC:
-					sendByte(0x03)
+					sendByte(0x03) // ^C 中断
 				case walk.KeyD:
-					sendByte(0x04)
+					sendByte(0x04) // ^D EOF
+				case walk.KeyE:
+					sendByte(0x05) // ^E
+				case walk.KeyF:
+					sendByte(0x06) // ^F
+				case walk.KeyG:
+					sendByte(0x07) // ^G bell
+				case walk.KeyH:
+					sendByte(0x08) // ^H backspace
+				case walk.KeyI:
+					sendByte(0x09) // ^I tab
+				case walk.KeyJ:
+					sendByte(0x0a) // ^J LF
+				case walk.KeyK:
+					sendByte(0x0b) // ^K
+				case walk.KeyL:
+					sendByte(0x0c) // ^L form feed / clear
+				case walk.KeyM:
+					sendByte(0x0d) // ^M CR
+				case walk.KeyN:
+					sendByte(0x0e) // ^N
+				case walk.KeyO:
+					sendByte(0x0f) // ^O
+				case walk.KeyP:
+					sendByte(0x10) // ^P
+				case walk.KeyQ:
+					sendByte(0x11) // ^Q XON
+				case walk.KeyR:
+					sendByte(0x12) // ^R
+				case walk.KeyS:
+					sendByte(0x13) // ^S XOFF
+				case walk.KeyT:
+					sendByte(0x14) // ^T
 				case walk.KeyU:
-					sendByte(0x15)
+					sendByte(0x15) // ^U kill line
+				case walk.KeyV:
+					sendByte(0x16) // ^V
+				case walk.KeyW:
+					sendByte(0x17) // ^W kill word
+				case walk.KeyX:
+					sendByte(0x18) // ^X
+				case walk.KeyY:
+					sendByte(0x19) // ^Y
+				case walk.KeyZ:
+					sendByte(0x1a) // ^Z suspend
 				}
 				return
 			}
 			// 字母/数字等可打印键：虚拟键即 ASCII 大写，按 Shift 还原小写
-			if c := vkToASCII(key, walk.ModifiersDown()&walk.ModShift != 0); c != 0 {
+			if c := vkToASCII(key, shift); c != 0 {
 				sendByte(c)
 			}
 		}
+		// 快照模式下：所有键都已被处理或显式忽略，绝不走 EDIT 默认行为。
+		// 若让 EDIT 插入字符，renderSnapshot 的 SetText 会与其竞争内部状态，
+		// 这是 htop 运行时按键卡死/闪退的根因之一。
 		return
 	}
 
