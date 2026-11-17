@@ -239,8 +239,7 @@ func (a *app) run() error {
 					PushButton{AssignTo: &a.btnOpen, Text: "▶  打开串口", OnClicked: a.toggleSerial,
 						MinSize: Size{Width: 96},
 						ToolTipText: "打开/关闭串口连接（状态变更后按钮文字切换）"},
-					PushButton{Text: "⟳", OnClicked: a.refreshPorts,
-						MinSize: Size{Width: 32},
+					PushButton{Text: "⚡ 刷新", OnClicked: a.refreshPorts,
 						ToolTipText: "重新枚举本机串口（CH340 优先选中）"},
 					Label{Text: "│", TextColor: walk.RGB(100, 110, 130)},
 					PushButton{Text: "📥  导出日志", OnClicked: a.exportLog,
@@ -338,7 +337,7 @@ func (a *app) run() error {
 						OnCurrentIndexChanged: a.onNicChanged},
 					Composite{Layout: HBox{MarginsZero: true, Spacing: 4}, Column: 2, Row: 2,
 						Children: []Widget{
-							PushButton{Text: "⟳", OnClicked: a.refreshNetIfs,
+							PushButton{Text: "⚡", OnClicked: a.refreshNetIfs,
 								MinSize: Size{Width: 28},
 								ToolTipText: "重新枚举网卡（如插拔了网线 / USB 网卡）"},
 						}},
