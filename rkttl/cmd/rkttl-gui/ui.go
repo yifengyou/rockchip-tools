@@ -159,29 +159,32 @@ func (a *app) run() error {
 
 	err := (MainWindow{
 		AssignTo: &mw,
-		Title:    "rkttl — Rockchip TTL 串口多端共享 (v" + version.Version + ")",
-		MinSize:  Size{Width: 900, Height: 600},
-		Size:     Size{Width: 1100, Height: 720},
+		Title:    "rkttl " + version.Version + " · Rockchip TTL 串口多端共享",
+		MinSize:  Size{Width: 920, Height: 600},
+		Size:     Size{Width: 1180, Height: 760},
 		Font:     Font{Family: "Microsoft YaHei UI", PointSize: 9},
-		Layout:   VBox{Margins: Margins{Left: 6, Top: 4, Right: 6, Bottom: 2}, Spacing: 6},
-		// XShell 风格分段状态栏
+		Layout:   VBox{Margins: Margins{Left: 8, Top: 6, Right: 8, Bottom: 4}, Spacing: 6},
+		// XShell 风格分段状态栏（符号 + 颜色暗示）
 		StatusBarItems: []StatusBarItem{
-			{AssignTo: &a.stSerial, Text: "● 未连接", Width: 190},
-			{AssignTo: &a.stRx, Text: "RX 0B", Width: 96},
-			{AssignTo: &a.stTx, Text: "TX 0B", Width: 96},
-			{AssignTo: &a.stSub, Text: "共享端 0", Width: 90},
-			{AssignTo: &a.stNet, Text: "HTTP ✗ TCP ✗", Width: 150},
-			{AssignTo: &a.stTheme, Text: "主题: 默认深色", Width: 150},
+			{AssignTo: &a.stSerial, Text: "○ 未连接", Width: 200},
+			{AssignTo: &a.stRx, Text: "↓ RX 0B", Width: 90},
+			{AssignTo: &a.stTx, Text: "↑ TX 0B", Width: 90},
+			{AssignTo: &a.stSub, Text: "👥 共享 0", Width: 92},
+			{AssignTo: &a.stNet, Text: "HTTP ✗ · TCP ✗", Width: 150},
+			{AssignTo: &a.stTheme, Text: "🎨 默认深色", Width: 150},
 		},
-		// XShell 风格工具条：Composite+PushButton 自绘（walk ToolBar 对
-		// 无图标按钮渲染空白，PushButton 显示文本可靠）
+		// XShell 风格工具条：符号按钮 + 紧凑分组
+		// 被移除的功能迁移到菜单：
+		//   "清空日志" → "日志(L)" 菜单
+		//   "HEX 发送" → "工具(T)" 菜单
 		MenuItems: []MenuItem{
 			Menu{
-				Text: "诊断(&D)",
+				Text: "文件(&F)",
 				Items: []MenuItem{
-					Action{Text: "禁用全屏快照模式（排查 reset 卡死）", Checkable: true,
-						AssignTo: &a.actNoSnap, OnTriggered: a.toggleNoSnap},
-					Action{Text: "打开配置目录", OnTriggered: a.openLogDir},
+					Action{Text: "导出日志...", OnTriggered: a.exportLog},
+					Action{Text: "导出屏幕内容...", OnTriggered: a.exportScreen},
+					Separator{},
+					Action{Text: "退出", OnTriggered: func() { a.mw.Close() }},
 				},
 			},
 			Menu{
@@ -216,38 +219,51 @@ func (a *app) run() error {
 							}
 						}()
 					}},
+					Separator{},
+					Action{Text: "打开日志目录", OnTriggered: a.openLogDir},
+				},
+			},
+			Menu{
+				Text: "诊断(&D)",
+				Items: []MenuItem{
+					Action{Text: "禁用全屏快照模式（排查 reset 卡死）", Checkable: true,
+						AssignTo: &a.actNoSnap, OnTriggered: a.toggleNoSnap},
 				},
 			},
 		},
 		Children: []Widget{
-			// —— 工具条（XShell 风格：核心操作一键直达） ——
-			Composite{
-				Layout: HBox{MarginsZero: true, Spacing: 4},
-				Children: []Widget{
-					PushButton{AssignTo: &a.btnOpen, Text: "打开串口", OnClicked: a.toggleSerial,
-						MinSize: Size{Width: 84}},
-					PushButton{Text: "刷新端口", OnClicked: a.refreshPorts},
-					Label{Text: "│", TextColor: walk.RGB(128, 128, 128)},
-					PushButton{Text: "导出日志", OnClicked: a.exportLog},
-					PushButton{Text: "导出屏幕", OnClicked: a.exportScreen},
-					PushButton{Text: "清空日志", OnClicked: a.clearLog,
-						ToolTipText: "清空接收缓冲与会话日志文件"},
-					PushButton{Text: "清屏", OnClicked: a.clearScreen,
-						ToolTipText: "仅清空屏幕显示（保留接收缓冲与日志，设备端不受影响）"},
-					Label{Text: "│", TextColor: walk.RGB(128, 128, 128)},
-					PushButton{Text: "HEX", OnClicked: a.sendHexLine,
-						ToolTipText: "把当前输入行按十六进制解析并发送"},
-					PushButton{Text: "帮助", OnClicked: a.showTcpHelp},
-				},
-			},
-			// —— 串口设置行（打开/关闭在工具条） ——
+			// —— 工具条（精简版：核心操作一键直达，其余在菜单） ——
 			Composite{
 				Layout: HBox{MarginsZero: true, Spacing: 6},
 				Children: []Widget{
-					Label{Text: "串口:"},
-					ComboBox{AssignTo: &a.portCombo, MinSize: Size{Width: 190}},
-					PushButton{Text: "刷新", OnClicked: a.refreshPorts},
-					Label{Text: "波特率:"},
+					PushButton{AssignTo: &a.btnOpen, Text: "▶  打开串口", OnClicked: a.toggleSerial,
+						MinSize: Size{Width: 96},
+						ToolTipText: "打开/关闭串口连接（状态变更后按钮文字切换）"},
+					PushButton{Text: "⟳", OnClicked: a.refreshPorts,
+						MinSize: Size{Width: 32},
+						ToolTipText: "重新枚举本机串口（CH340 优先选中）"},
+					Label{Text: "│", TextColor: walk.RGB(100, 110, 130)},
+					PushButton{Text: "📥  导出日志", OnClicked: a.exportLog,
+						ToolTipText: "下载完整会话日志（原始字节流，含全部历史）"},
+					PushButton{Text: "📸  导出屏幕", OnClicked: a.exportScreen,
+						ToolTipText: "导出当前终端屏幕快照（含 htop 等全屏程序）"},
+					PushButton{Text: "🧹  清屏", OnClicked: a.clearScreen,
+						ToolTipText: "仅清空屏幕显示（保留接收缓冲与日志，设备端不受影响）"},
+					Label{Text: "│", TextColor: walk.RGB(100, 110, 130)},
+					PushButton{Text: "❓  帮助", OnClicked: a.showTcpHelp,
+						ToolTipText: "TCP 桥 / HTTP API 远端接入方式"},
+					Label{Text: "          快捷：Enter 发送 · Ctrl+C 中断 · Tab/Esc 透传",
+						TextColor: walk.RGB(100, 110, 130)},
+				},
+			},
+			// —— 串口设置行 ——
+			Composite{
+				Layout: HBox{MarginsZero: true, Spacing: 6},
+				Children: []Widget{
+					Label{Text: "串口"},
+					ComboBox{AssignTo: &a.portCombo, MinSize: Size{Width: 200},
+						ToolTipText: "CH340 会自动优先选中；可手动选择其它串口"},
+					Label{Text: "波特率"},
 					NumberEdit{
 						// 注意：declarative 的 Value/Text/ReadOnly 等字段类型是
 						// Property(interface{})。Value 必须写 float64 字面量
@@ -256,13 +272,14 @@ func (a *app) run() error {
 						// 导致 Create 失败、程序启动即崩。
 						AssignTo: &a.baudEdit, Value: 1500000.0,
 						MinValue: 300, MaxValue: 4000000, Decimals: 0,
-						SpinButtonsVisible: true, MinSize: Size{Width: 120},
+						SpinButtonsVisible: true, MinSize: Size{Width: 118},
 						ToolTipText: "Rockchip 调试串口通常为 1500000",
 					},
-					CheckBox{AssignTo: &a.ansiChk, Text: "过滤ANSI", Checked: true,
-						ToolTipText: "终端区不解析颜色转义序列，仅清理显示"},
+					Label{Text: "│", TextColor: walk.RGB(100, 110, 130)},
+					CheckBox{AssignTo: &a.ansiChk, Text: "过滤 ANSI", Checked: true,
+						ToolTipText: "终端区不解析颜色转义序列，仅清理显示（网页控制台仍支持彩色）"},
 					CheckBox{AssignTo: &a.autoChk, Text: "断线自动重连", Checked: true,
-						ToolTipText: "USB 重新插拔后自动恢复串口连接"},
+						ToolTipText: "USB 重新插拔 / 设备 reset 后自动恢复串口连接"},
 				},
 			},
 			// —— 终端区（xshell 式：直接在终端末尾输入，Enter 发送） ——
@@ -290,56 +307,68 @@ func (a *app) run() error {
 			},
 			// —— 网络共享 ——
 			GroupBox{
-				Title: " 网络共享（远端与本机同时收发，tmux 式 attach） ",
+				Title: " 网络共享 · 远端与本机同时收发（tmux 式 attach） ",
 				Layout: Grid{Columns: 3, Spacing: 6,
-					Margins: Margins{Left: 8, Top: 4, Right: 8, Bottom: 8}},
+					Margins: Margins{Left: 10, Top: 6, Right: 10, Bottom: 8}},
 				Children: []Widget{
 					CheckBox{AssignTo: &a.httpChk, Text: "HTTP API / 网页控制台", Checked: true,
 						Column: 0, Row: 0,
-						ToolTipText: "远端浏览器打开控制台；AI 通过 /api/* 控制"},
-					LineEdit{AssignTo: &a.httpAddr, Text: "0.0.0.0:7373", Column: 1, Row: 0},
-					Label{AssignTo: &a.httpState, Text: "未启动", Column: 2, Row: 0},
+						ToolTipText: "远端浏览器打开 xterm.js 控制台；AI 通过 /api/* 控制"},
+					LineEdit{AssignTo: &a.httpAddr, Text: "0.0.0.0:7373", Column: 1, Row: 0,
+						ToolTipText: "HTTP 监听地址。0.0.0.0 = 所有网卡；也可填具体 IP"},
+					Label{AssignTo: &a.httpState, Text: "未启动", Column: 2, Row: 0,
+						TextColor: walk.RGB(120, 130, 145)},
 
-					CheckBox{AssignTo: &a.tcpChk, Text: "TCP 桥 (nc/socat)", Column: 0, Row: 1,
-						ToolTipText: "裸 TCP 字节流，多客户端共享"},
+					CheckBox{AssignTo: &a.tcpChk, Text: "TCP 桥 (nc / socat)", Column: 0, Row: 1,
+						ToolTipText: "裸 TCP 字节流，多客户端共享（nc / socat / screen 直连）"},
 					LineEdit{AssignTo: &a.tcpAddr, Text: "0.0.0.0:9999", Column: 1, Row: 1},
 					Composite{Layout: HBox{MarginsZero: true, Spacing: 4}, Column: 2, Row: 1,
 						Children: []Widget{
-							Label{AssignTo: &a.tcpState, Text: "未启动"},
-							PushButton{Text: "帮助", OnClicked: a.showTcpHelp,
-								ToolTipText: "Linux / 远端如何连接 TCP 桥（nc / socat）—— 点击查看具体命令"},
+							Label{AssignTo: &a.tcpState, Text: "未启动",
+								TextColor: walk.RGB(120, 130, 145)},
+							PushButton{Text: "❓", OnClicked: a.showTcpHelp,
+								MinSize: Size{Width: 28},
+								ToolTipText: "查看 nc / socat 具体连接命令（带本机 IP，可一键复制）"},
 						}},
 
-					Label{Text: "对外网卡:", Column: 0, Row: 2,
+					Label{Text: "对外网卡", Column: 0, Row: 2,
 						ToolTipText: "选择对远端有效的网卡；选中具体网卡时监听地址自动绑定该 IP"},
-					ComboBox{AssignTo: &a.nicCombo, Column: 1, Row: 2, MinSize: Size{Width: 220},
-						ToolTipText:           "虚拟网卡（VMware/WSL/Docker 等）的地址远端通常不可达；列表按物理网卡优先排序",
+					ComboBox{AssignTo: &a.nicCombo, Column: 1, Row: 2, MinSize: Size{Width: 230},
+						ToolTipText:           "虚拟网卡（VMware/WSL/Docker）地址远端通常不可达；列表按物理网卡优先",
 						OnCurrentIndexChanged: a.onNicChanged},
 					Composite{Layout: HBox{MarginsZero: true, Spacing: 4}, Column: 2, Row: 2,
 						Children: []Widget{
-							PushButton{Text: "刷新", OnClicked: a.refreshNetIfs,
-								ToolTipText: "重新枚举网卡（如插拔了网线/USB 网卡）"},
+							PushButton{Text: "⟳", OnClicked: a.refreshNetIfs,
+								MinSize: Size{Width: 28},
+								ToolTipText: "重新枚举网卡（如插拔了网线 / USB 网卡）"},
 						}},
 
-					Label{Text: "访问令牌:", Column: 0, Row: 3},
-					LineEdit{AssignTo: &a.tokenEdit, ReadOnly: true, Column: 1, Row: 3},
+					Label{Text: "访问令牌", Column: 0, Row: 3},
+					LineEdit{AssignTo: &a.tokenEdit, ReadOnly: true, Column: 1, Row: 3,
+						ToolTipText: "所有 API/网页/SSE 请求需带此令牌（URL ?token= 或 Authorization: Bearer）"},
 					Composite{Layout: HBox{MarginsZero: true, Spacing: 4}, Column: 2, Row: 3,
 						Children: []Widget{
-							PushButton{Text: "重新生成", OnClicked: a.regenToken},
+							PushButton{Text: "重新生成", OnClicked: a.regenToken,
+								ToolTipText: "轮换令牌（旧令牌立即失效，需通知远端更新）"},
 						}},
 
-					Label{Text: "控制台地址:", Column: 0, Row: 4},
-					Label{AssignTo: &a.urlHint, Text: "（启动后显示）", Column: 1, Row: 4, ColumnSpan: 2},
+					Label{Text: "控制台地址", Column: 0, Row: 4},
+					Label{AssignTo: &a.urlHint, Text: "（启动后显示）", Column: 1, Row: 4, ColumnSpan: 2,
+						TextColor: walk.RGB(120, 130, 145)},
 
-					Label{Text: "会话日志:", Column: 0, Row: 5,
-						ToolTipText: "串口打开时自动记录原始字节流到 logs/ 目录；网络端连接时可回放/导出"},
-					Label{AssignTo: &a.logHint, Text: "串口打开后开始记录", Column: 1, Row: 5, ColumnSpan: 2},
+					Label{Text: "会话日志", Column: 0, Row: 5,
+						ToolTipText: "串口打开时自动记录原始字节流到 logs/；网络端可回放 / 导出"},
+					Label{AssignTo: &a.logHint, Text: "串口打开后开始记录", Column: 1, Row: 5, ColumnSpan: 2,
+						TextColor: walk.RGB(120, 130, 145)},
 
-					Composite{Layout: HBox{MarginsZero: true, Spacing: 4}, Column: 0, Row: 6, ColumnSpan: 3,
+					Composite{Layout: HBox{MarginsZero: true, Spacing: 6}, Column: 0, Row: 6, ColumnSpan: 3,
 						Children: []Widget{
-							PushButton{Text: "应用网络设置", OnClicked: a.applyNetwork},
-							PushButton{Text: "复制控制台URL", OnClicked: a.copyURL},
-							PushButton{Text: "打开网页控制台", OnClicked: a.openConsole},
+							PushButton{Text: "✓  应用网络设置", OnClicked: a.applyNetwork,
+								ToolTipText: "按当前勾选与地址启动 / 重配 HTTP 与 TCP 服务"},
+							PushButton{Text: "📋  复制控制台 URL", OnClicked: a.copyURL,
+								ToolTipText: "把带令牌的完整控制台地址复制到剪贴板"},
+							PushButton{Text: "🌐  打开网页控制台", OnClicked: a.openConsole,
+								ToolTipText: "在默认浏览器中打开 xterm.js 控制台"},
 						}},
 				},
 			},
@@ -1042,25 +1071,25 @@ func (a *app) updateLogHint() {
 
 func (a *app) updateStatusItem() {
 	st := a.hub.Status()
-	// 分段 1：连接状态（XShell 风格 ● 标记）
+	// 分段 1：连接状态（● 标记颜色暗示）
 	if st.Open {
 		_ = a.stSerial.SetText(fmt.Sprintf("● %s @ %d", st.Port, st.Baud))
 	} else if st.LastError != "" {
 		_ = a.stSerial.SetText("● 未连接: " + st.LastError)
 	} else {
-		_ = a.stSerial.SetText("● 未连接")
+		_ = a.stSerial.SetText("○ 未连接")
 	}
-	_ = a.stRx.SetText("RX " + human(st.Received))
-	_ = a.stTx.SetText("TX " + human(st.Sent))
-	_ = a.stSub.SetText(fmt.Sprintf("共享端 %d", st.Subscribers))
+	_ = a.stRx.SetText("↓ RX " + human(st.Received))
+	_ = a.stTx.SetText("↑ TX " + human(st.Sent))
+	_ = a.stSub.SetText(fmt.Sprintf("👥 共享 %d", st.Subscribers))
 	net := "HTTP ✗"
 	if a.apiRunning {
 		net = "HTTP ✓"
 	}
 	if a.bridgeRun {
-		net += fmt.Sprintf(" TCP ✓(%d)", a.bridge.ClientCount())
+		net += fmt.Sprintf(" · TCP ✓(%d)", a.bridge.ClientCount())
 	} else {
-		net += " TCP ✗"
+		net += " · TCP ✗"
 	}
 	_ = a.stNet.SetText(net)
 }

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""生成 rkttl 应用图标 v2（超采样抗锯齿，无第三方依赖）。
+"""生成 rkttl 应用图标 v3（超采样抗锯齿，无第三方依赖）。
 
-设计：深灰蓝渐变圆角底 + 终端绿 ">_" 提示符（经典 terminal 图形）。
+设计：深色石板底 + 终端绿信号波纹（串口数据流的现代演绎）。
+灵感：示波器波形 + 终端提示符 ">_" 的融合，暗示"实时数据流"的
+专业串口终端工具。比 v2 的静态 chevron 更有动感和识别度。
+
 4 倍超采样后盒式下采样，得到平滑的抗锯齿边缘。
 输出多尺寸 ICO（16/24/32/48/64/128/256）。
 """
@@ -9,16 +12,12 @@
 import struct
 
 
-# ---- 基础几何（浮点坐标，作用于超采样画布） ----
-
 def in_rounded_rect(px, py, x0, y0, x1, y1, r):
     """点是否在圆角矩形内。"""
     if px < x0 or px > x1 or py < y0 or py > y1:
         return False
-    # 四角圆角判定
     for cx, cy in ((x0 + r, y0 + r), (x1 - r, y0 + r), (x0 + r, y1 - r), (x1 - r, y1 - r)):
         if (px < x0 + r or px > x1 - r) and (py < y0 + r or py > y1 - r):
-            # 仅在角区需要圆判定
             if (px - x0 < r and py - y0 < r):
                 return (px - (x0 + r)) ** 2 + (py - (y0 + r)) ** 2 <= r * r
             if (x1 - px < r and py - y0 < r):
@@ -42,25 +41,23 @@ def dist_to_seg(px, py, x1, y1, x2, y2):
 
 
 def render(size, ss=4):
-    """渲染 size×size 图标（BGRA 像素，预乘前的直接色值）。"""
-    W = size * ss  # 超采样画布
-    # 逻辑坐标（按 size 归一化，乘 ss）
+    """渲染 size×size 图标（BGRA 像素）。"""
+    W = size * ss
     def S(v):
         return v / 256.0 * W
 
-    # 调色
-    grad_top = (0x37, 0x46, 0x58)    # 顶部 #374658
-    grad_bot = (0x1F, 0x29, 0x35)    # 底部 #1F2935
-    edge = (0x59, 0x6E, 0x87, 0x55)  # 半透明描边
-    green = (0x9E, 0xC9, 0x7F)       # 终端绿 #9EC97F
-    green_dim = (0x7A, 0xA8, 0x5E)   # 略暗（下划线）
+    # 调色板（现代深色 + 终端绿）
+    grad_top = (0x2D, 0x3A, 0x4D)    # 顶部 #2D3A4D 深蓝灰
+    grad_bot = (0x1A, 0x22, 0x2E)    # 底部 #1A222E 近黑
+    edge = (0x5A, 0x7A, 0xA8, 0x66)  # 半透明描边（带蓝）
+    green = (0x6E, 0xD0, 0x9A)       # 终端绿 #6ED09A（亮）
+    green_dim = (0x4A, 0xA0, 0x70)   # 暗绿 #4AA070
 
     px = [[None] * W for _ in range(W)]
-    r = S(52)
-    half = 1.5  # 描边半宽（超采样像素）≈ 0.4 逻辑像素
+    r = S(56)
+    half = 1.5
     for y in range(W):
         for x in range(W):
-            # 背景圆角矩形（含渐变）
             inside = in_rounded_rect(x + 0.5, y + 0.5, S(14), S(14), S(242), S(242), r)
             in_edge = in_rounded_rect(x + 0.5, y + 0.5, S(14) - half, S(14) - half,
                                       S(242) + half, S(242) + half, r + half)
@@ -72,7 +69,6 @@ def render(size, ss=4):
             cg = int(grad_top[1] + (grad_bot[1] - grad_top[1]) * t)
             cb = int(grad_top[2] + (grad_bot[2] - grad_top[2]) * t)
             if not inside:
-                # 边缘带（描边）：与背景色混合
                 a = edge[3] / 255.0
                 px[y][x] = (int(cr * (1 - a) + edge[0] * a),
                             int(cg * (1 - a) + edge[1] * a),
@@ -80,27 +76,52 @@ def render(size, ss=4):
                 continue
             px[y][x] = (cr, cg, cb, 255)
 
-    # ">" 提示符：两段粗线（chevron），带圆头
-    w = S(26) / 2  # 线宽一半
-    pts = [(S(86), S(76)), (S(140), S(128)), (S(86), S(180))]
-    for y in range(W):
-        for x in range(W):
-            if px[y][x][3] == 0:
-                continue
-            d1 = dist_to_seg(x + 0.5, y + 0.5, pts[0][0], pts[0][1], pts[1][0], pts[1][1])
-            d2 = dist_to_seg(x + 0.5, y + 0.5, pts[1][0], pts[1][1], pts[2][0], pts[2][1])
-            if d1 <= w or d2 <= w:
-                px[y][x] = (*green, 255)
-
-    # "_" 光标横条（圆角）
-    ux0, uy0, ux1, uy1 = S(158), S(160), S(212), S(184)
-    ur = S(8)
-    for y in range(W):
-        for x in range(W):
-            if px[y][x][3] == 0:
-                continue
-            if in_rounded_rect(x + 0.5, y + 0.5, ux0, uy0, ux1, uy1, ur):
-                px[y][x] = (*green_dim, 255)
+    # 信号波纹：三条水平起伏的线（示意串口数据流）
+    # 三条线不同相位，形成"实时数据"的动感
+    waves = [
+        # (y_offset, amplitude, phase, color, thickness)
+        (S(88),  S(28), 0.0, green,     S(14)),
+        (S(128), S(24), 0.7, green,     S(12)),
+        (S(168), S(20), 1.4, green_dim, S(10)),
+    ]
+    x_start, x_end = S(46), S(210)
+    for y_off, amp, phase, color, thick in waves:
+        half_t = thick / 2
+        # 采样波形路径为线段
+        steps = 32
+        pts = []
+        for i in range(steps + 1):
+            t = i / steps
+            x = x_start + (x_end - x_start) * t
+            # 平滑的方波近似（方波 = 串口数字信号的特征）
+            import math
+            s = math.sin(t * 4 * math.pi + phase * math.pi)
+            # 把 sin 锐化为方波感（tanh 增强）
+            s_sq = math.tanh(s * 2.5)
+            y = y_off + s_sq * amp
+            pts.append((x, y))
+        # 渲染：点到路径距离
+        for y in range(W):
+            for x in range(W):
+                if px[y][x][3] == 0:
+                    continue
+                d_min = 1e9
+                for i in range(steps):
+                    d = dist_to_seg(x + 0.5, y + 0.5,
+                                    pts[i][0], pts[i][1],
+                                    pts[i + 1][0], pts[i + 1][1])
+                    if d < d_min:
+                        d_min = d
+                if d_min <= half_t:
+                    # 抗锯齿：按距离衰减亮度
+                    alpha = max(0.0, 1.0 - (d_min / half_t) * 0.3)
+                    cr, cg, cb = px[y][x][0], px[y][x][1], px[y][x][2]
+                    px[y][x] = (
+                        int(color[0] * alpha + cr * (1 - alpha)),
+                        int(color[1] * alpha + cg * (1 - alpha)),
+                        int(color[2] * alpha + cb * (1 - alpha)),
+                        255,
+                    )
 
     # 盒式下采样
     out = []
